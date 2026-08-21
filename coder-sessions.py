@@ -2,9 +2,9 @@
 """Browse running Coder agent sessions and open each as its own herdr workspace.
 
 Coder task workspaces have no tmux: the agent runs under agentapi on port 3284.
-Picking a session opens a workspace holding `agentty` on top (two thirds of the
-height) and a plain ssh shell below it. Picking a session that is already open
-focuses its workspace instead of building a second one.
+Picking a session opens a workspace running `agentty` on the session, with the
+session's changes mirrored into a local worktree beside it. Picking a session
+that is already open focuses its workspace instead of building a second one.
 
     coder-sessions.py                  fzf picker (the plugin's pane and action)
     coder-sessions.py --list           print the rows, no picker
@@ -20,8 +20,7 @@ a cache that --show reads back.
 
 Settings, all optional, in $HERDR_PLUGIN_CONFIG_DIR/config.json:
 
-    {"ratio": 0.667, "host_suffix": ".coder",
-     "clone_root": "~/projects/github", "mirror": true}
+    {"host_suffix": ".coder", "clone_root": "~/projects/github", "mirror": true}
 """
 
 import argparse
@@ -44,7 +43,6 @@ CACHE = os.path.join(os.environ.get("HERDR_PLUGIN_STATE_DIR") or tempfile.gettem
 SELF = os.path.abspath(__file__)
 
 DEFAULTS = {
-    "ratio": 0.667,        # share of the height for the top pane: agentty
     "host_suffix": ".coder",  # ssh host is <session name> + this
     "clone_root": "~/projects/github",  # <clone_root>/<owner>/<repo>, as gh-dash maps it
     "mirror": True,        # mirror the session into a local worktree when we can
@@ -454,11 +452,6 @@ def open_session(name, sessions=None):
     herdr("workspace", "report-metadata", workspace,
           "--source", METADATA_SOURCE, "--token", f"{TOKEN}={name}")
 
-    # Split while both panes are still bare shells. Starting agentty first would
-    # only make it repaint at a new size, and a `pane run` aimed at a pane that
-    # already hosts agentty types into the agent's composer instead.
-    bottom = herdr("pane", "split", top, "--direction", "down",
-                   "--ratio", str(conf["ratio"]), "--no-focus")["result"]["pane"]["pane_id"]
     host = f"{name}{conf['host_suffix']}"
     # Refresh the mirror whenever the agent finishes a turn: agentty already knows
     # the exact running -> stable moment, so nothing has to poll.
@@ -466,9 +459,8 @@ def open_session(name, sessions=None):
     if checkout:
         hook = (f"AGENTTY_ON_IDLE={shlex.quote(f'{SELF} --mirror {name}')} ")
     herdr("pane", "run", top, f"{hook}{agentty_cmd()} {host}")
-    herdr("pane", "run", bottom, f"ssh {host}")
     herdr("workspace", "focus", workspace)
-    print(f"opened {workspace} \"{label}\" for {name}: agentty in {top}, ssh in {bottom}")
+    print(f"opened {workspace} \"{label}\" for {name}: agentty in {top}")
 
 
 def pick(sessions):

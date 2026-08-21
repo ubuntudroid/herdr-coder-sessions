@@ -2,7 +2,7 @@ id = "ubuntudroid.coder-sessions"
 name = "Coder Agent Sessions"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Browse running Coder agent sessions and open each as its own workspace: agentty on top (two thirds) with a plain ssh shell below. Coder task workspaces have no tmux -- the agent runs under agentapi -- so agentty is what makes the session scrollable and typable."
+description = "Browse running Coder agent sessions and open each as its own workspace: agentty on the session, with its changes mirrored into a local worktree so a review pane works even before there is a PR. Coder task workspaces have no tmux -- the agent runs under agentapi -- so agentty is what makes the session scrollable and typable."
 platforms = ["linux", "macos"]
 
 [[actions]]

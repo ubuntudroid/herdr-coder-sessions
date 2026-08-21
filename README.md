@@ -15,12 +15,15 @@ local echo over the same endpoints.
 Each session gets one workspace, labelled with the session name:
 
 ```
-┌───────────────────────────────┐
-│ agentty <session>.coder       │  two thirds — the agent's live screen
-├───────────────────────────────┤
-│ ssh <session>.coder           │  one third — a plain shell in the workspace
-└───────────────────────────────┘
+┌───────────────────────────┬───────────────────┐
+│ agentty <session>.coder   │ reviewr           │
+│ the agent's live screen   │ the session's     │
+│                           │ changes, mirrored │
+└───────────────────────────┴───────────────────┘
 ```
+
+reviewr opens itself (herdr's `worktree.created` event); the plugin never mentions it. Need a
+shell on the box? `ssh <session>.coder` in any pane.
 
 Picking a session that is already open focuses its workspace instead of building
 a second one; those rows are marked `●` in the list.
@@ -166,7 +169,6 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `ratio` | `0.667` | share of the height given to the agentty pane |
 | `host_suffix` | `".coder"` | appended to the session name to form the ssh host |
 | `clone_root` | `"~/projects/github"` | where `<owner>/<repo>` clones live |
 | `mirror` | `true` | mirror the session into a local worktree on open |
