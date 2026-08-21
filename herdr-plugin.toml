@@ -22,3 +22,11 @@ placement = "popup"
 width = "90%"
 height = "80%"
 command = ["python3", "coder-sessions.py"]
+
+# Refresh the mirror behind the focused session workspace. Bound to prefix+ctrl+m;
+# the idle hook agentty fires does this automatically after each agent turn.
+[[actions]]
+id = "refresh"
+title = "Coder sessions: refresh this mirror"
+contexts = ["workspace", "tab", "pane"]
+command = ["python3", "coder-sessions.py", "--refresh"]

@@ -105,6 +105,20 @@ plugin reproduces the session locally and reviews that. On open it:
 `reviewr` auto-opens in that workspace on herdr's `worktree.created` event, so the review pane
 needs no wiring — you end up with agentty over ssh on the left and reviewr on the right.
 
+### When it refreshes
+
+- **After every agent turn.** The plugin launches agentty with
+  `AGENTTY_ON_IDLE="<script> --mirror <session>"`, and agentty runs that hook when the agent's
+  status goes `running → stable`. It already watches `/events` for the dot, so nothing polls, and
+  the refresh lands exactly when new work exists and nothing is mid-write. `AGENTTY_ON_IDLE` is
+  generic — agentty knows nothing about this plugin.
+- **On demand**, with `prefix+ctrl+m` (the `refresh` action), which refreshes the focused
+  workspace's mirror. It reads the session name from the `coder` metadata token, so it needs no
+  argument, and refuses cleanly in a workspace that is not a session's.
+- **On first open**, as part of building the workspace.
+
+Re-picking an already-open session only focuses it; it does not refresh.
+
 The mirror is **derived, never authored in**: `--mirror <name>` refreshes it by resetting hard
 to the session's current state. A marker in the worktree's git dir (not the working tree, so it
 never shows in `git status`) records that the worktree is a mirror; without it the refresh

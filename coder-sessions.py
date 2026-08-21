@@ -11,6 +11,7 @@ focuses its workspace instead of building a second one.
     coder-sessions.py --open NAME      open or focus one session's workspace
     coder-sessions.py --show NAME      preview text for one session
     coder-sessions.py --mirror NAME    refresh one session's local mirror worktree
+    coder-sessions.py --refresh        same, for the focused workspace (plugin action)
     coder-sessions.py --relabel        re-apply the label scheme to open workspaces
     coder-sessions.py --selftest       check the naming helpers
 
@@ -459,7 +460,12 @@ def open_session(name, sessions=None):
     bottom = herdr("pane", "split", top, "--direction", "down",
                    "--ratio", str(conf["ratio"]), "--no-focus")["result"]["pane"]["pane_id"]
     host = f"{name}{conf['host_suffix']}"
-    herdr("pane", "run", top, f"{agentty_cmd()} {host}")
+    # Refresh the mirror whenever the agent finishes a turn: agentty already knows
+    # the exact running -> stable moment, so nothing has to poll.
+    hook = ""
+    if checkout:
+        hook = (f"AGENTTY_ON_IDLE={shlex.quote(f'{SELF} --mirror {name}')} ")
+    herdr("pane", "run", top, f"{hook}{agentty_cmd()} {host}")
     herdr("pane", "run", bottom, f"ssh {host}")
     herdr("workspace", "focus", workspace)
     print(f"opened {workspace} \"{label}\" for {name}: agentty in {top}, ssh in {bottom}")
@@ -480,6 +486,24 @@ def pick(sessions):
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
     return proc.stdout.split("\t", 1)[0].strip()
+
+
+def refresh(workspace=None):
+    """Refresh the mirror behind a workspace -- the plugin action's job.
+
+    Takes the workspace from the action's environment, so a keybinding needs no
+    argument, and reads the session name from the token this plugin stamps.
+    """
+    workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
+    if not workspace:
+        sys.exit("no workspace to refresh (HERDR_WORKSPACE_ID unset)")
+    match = [w for w in herdr("workspace", "list").get("result", {}).get("workspaces", [])
+             if w["workspace_id"] == workspace]
+    name = (match[0].get("tokens") or {}).get(TOKEN) if match else None
+    if not name:
+        sys.exit(f"{workspace} is not a Coder session workspace "
+                 f"(no {TOKEN} token) -- nothing to refresh")
+    mirror_session(name, settings())
 
 
 def relabel():
@@ -547,6 +571,8 @@ def selftest():
 def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("--selftest", action="store_true", help="check the pure helpers")
+    parser.add_argument("--refresh", action="store_true",
+                        help="refresh the focused workspace's mirror (the plugin action)")
     parser.add_argument("--mirror", metavar="NAME",
                         help="refresh one session's local mirror worktree, no panes")
     parser.add_argument("--relabel", action="store_true",
@@ -560,6 +586,9 @@ def main():
 
     if args.selftest:
         return selftest()
+
+    if args.refresh:
+        return refresh()
 
     if args.mirror:
         return mirror_session(args.mirror, settings(), focus=False)

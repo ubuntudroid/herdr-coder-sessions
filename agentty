@@ -103,6 +103,9 @@ def open_tunnel(host, remote_port):
 
 
 HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
+# Run this when the agent finishes a turn (running -> stable). Generic on purpose:
+# agentty knows nothing about who wants the hook or why.
+ON_IDLE = os.environ.get("AGENTTY_ON_IDLE")
 HERDR_PANE = os.environ.get("HERDR_PANE_ID")
 # agentapi's AgentStatus is only stable|running, so there is no blocked state to
 # mirror; an agent_error event is surfaced as unknown plus its message.
@@ -114,6 +117,17 @@ def agent_label(target):
     stem = re.sub(r"[^a-z0-9_-]+", "-", target.split(":")[0].split(".")[0].lower())
     stem = stem.strip("-") or "agentapi"
     return (stem if stem[0].isalpha() else "a" + stem)[:32]
+
+
+def on_idle():
+    """Fire the turn-finished hook, detached: a slow hook must not stall the UI."""
+    if not ON_IDLE:
+        return
+    try:
+        subprocess.Popen(ON_IDLE, shell=True, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except Exception:
+        pass  # a broken hook is never worth taking the client down for
 
 
 def report_agent(label, state, seq, message=None):
@@ -134,6 +148,7 @@ def watch_status(base, label, st):
                 status = json.load(resp).get("status")
             seq += 1
             report_agent(label, HERDR_STATE.get(status, "unknown"), seq)
+            was_running = status == "running"
             with urllib.request.urlopen(base + "/events") as resp:
                 event = None
                 for raw in resp:
@@ -153,9 +168,14 @@ def watch_status(base, label, st):
                             report_agent(label, "unknown", seq,
                                          payload.get("message") or "agent error")
                         else:
-                            report_agent(label,
-                                         HERDR_STATE.get(payload.get("status"), "unknown"),
-                                         seq)
+                            status = payload.get("status")
+                            report_agent(label, HERDR_STATE.get(status, "unknown"), seq)
+                            # A turn just ended: new work exists and nothing is
+                            # mid-write. That is the moment a mirror is worth
+                            # refreshing.
+                            if status == "stable" and was_running:
+                                on_idle()
+                            was_running = status == "running"
         except Exception:
             time.sleep(2)  # server restart or tunnel blip; try again
 
