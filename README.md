@@ -87,6 +87,34 @@ The plugin runs the `agentty` sitting next to it, not one from `PATH`, so
 installing the plugin is all you need and the two can never drift apart. See
 [agentty](#agentty) for using it standalone.
 
+## Mirroring
+
+A session's work lives on the remote workspace, and usually there is no PR yet — so the
+plugin reproduces the session locally and reviews that. On open it:
+
+1. asks the session for its repo root, branch and `origin` URL over ssh;
+2. finds the matching local clone (`clone_root/<owner>/<repo>`, the same mapping gh-dash's
+   `repoPaths` uses) — if there is none, it falls back to a plain workspace and skips the rest;
+3. fetches `+HEAD:<branch>` **straight from the workspace over ssh**, so commits the agent has
+   not pushed are included, onto a local branch with the session's own name;
+4. creates a herdr worktree from that clone, which makes the workspace worktree-backed (herdr
+   then shows the branch under the name in the sidebar);
+5. applies the session's uncommitted work: `git diff HEAD` for tracked files, plus a tar of
+   `git ls-files -o --exclude-standard` for untracked ones.
+
+`reviewr` auto-opens in that workspace on herdr's `worktree.created` event, so the review pane
+needs no wiring — you end up with agentty over ssh on the left and reviewr on the right.
+
+The mirror is **derived, never authored in**: `--mirror <name>` refreshes it by resetting hard
+to the session's current state. A marker in the worktree's git dir (not the working tree, so it
+never shows in `git status`) records that the worktree is a mirror; without it the refresh
+refuses, so a worktree you made yourself is never reset.
+
+Two deliberate choices: the source refspec is `HEAD`, not the branch name, because a workspace
+can hold several session branches and `HEAD` is unambiguous; and `git add -N` is *not* used to
+capture untracked files, because it writes to the live agent's index and would show up in its
+own `git status`.
+
 ## Requirements
 
 - `coder` CLI, logged in. Sessions come from `coder task list`.
@@ -126,6 +154,8 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
 | --- | --- | --- |
 | `ratio` | `0.667` | share of the height given to the agentty pane |
 | `host_suffix` | `".coder"` | appended to the session name to form the ssh host |
+| `clone_root` | `"~/projects/github"` | where `<owner>/<repo>` clones live |
+| `mirror` | `true` | mirror the session into a local worktree on open |
 
 ## Notes
 

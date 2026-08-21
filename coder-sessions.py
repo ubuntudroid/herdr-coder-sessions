@@ -10,6 +10,7 @@ focuses its workspace instead of building a second one.
     coder-sessions.py --list           print the rows, no picker
     coder-sessions.py --open NAME      open or focus one session's workspace
     coder-sessions.py --show NAME      preview text for one session
+    coder-sessions.py --mirror NAME    refresh one session's local mirror worktree
     coder-sessions.py --relabel        re-apply the label scheme to open workspaces
     coder-sessions.py --selftest       check the naming helpers
 
@@ -18,7 +19,8 @@ a cache that --show reads back.
 
 Settings, all optional, in $HERDR_PLUGIN_CONFIG_DIR/config.json:
 
-    {"ratio": 0.667, "host_suffix": ".coder"}
+    {"ratio": 0.667, "host_suffix": ".coder",
+     "clone_root": "~/projects/github", "mirror": true}
 """
 
 import argparse
@@ -43,6 +45,8 @@ SELF = os.path.abspath(__file__)
 DEFAULTS = {
     "ratio": 0.667,        # share of the height for the top pane: agentty
     "host_suffix": ".coder",  # ssh host is <session name> + this
+    "clone_root": "~/projects/github",  # <clone_root>/<owner>/<repo>, as gh-dash maps it
+    "mirror": True,        # mirror the session into a local worktree when we can
 }
 
 DIM, BOLD, RESET = "\x1b[2m", "\x1b[1m", "\x1b[0m"
@@ -150,6 +154,183 @@ def workspace_label(session):
     return f"{ICON} {head} · {name}"
 
 
+MIRROR_MARK = "coder-mirror"  # marks a worktree as derived, so refreshing may reset it
+
+
+def mirror_marker(checkout):
+    """Marker path inside the worktree's git dir, so it never shows in status."""
+    gitdir = run(["git", "-C", checkout, "rev-parse", "--absolute-git-dir"]).strip()
+    return os.path.join(gitdir, MIRROR_MARK)
+
+
+def is_mirror(checkout):
+    stray = os.path.join(checkout, "." + MIRROR_MARK)  # pre-0.2 in-tree marker
+    if os.path.exists(stray):
+        os.remove(stray)
+        open(mirror_marker(checkout), "w").close()
+    return os.path.exists(mirror_marker(checkout))
+
+
+def repo_slug(origin_url):
+    """`owner/repo` from any of git@host:o/r.git, https://host/o/r.git, ssh://host/o/r."""
+    url = origin_url.strip().removesuffix(".git")
+    if not url:
+        return None
+    body = url.split("://", 1)[-1]
+    if "@" in body and ":" in body and "/" in body.split(":", 1)[1]:
+        body = body.split(":", 1)[1]  # scp-style: host:owner/repo
+    parts = [seg for seg in body.split("/") if seg]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+
+
+def clone_path(slug, clone_root):
+    """Where that repo is cloned locally, or None if it is not."""
+    if not slug:
+        return None
+    path = os.path.join(os.path.expanduser(clone_root), *slug.split("/"))
+    return path if os.path.isdir(os.path.join(path, ".git")) else None
+
+
+def ssh_out(host, command):
+    """Run one command on the session host. Trailing newline stripped: a stray
+    CR here silently corrupts a git refspec."""
+    return run(["ssh", "-o", "ConnectTimeout=20", "-o", "BatchMode=yes",
+                host, command]).strip()
+
+
+def remote_repo(host):
+    """The session's checkout: (repo path, branch, origin slug).
+
+    The login directory is inside the repo (the Coder template puts it there), so
+    ask git from there rather than guessing a name.
+    """
+    probe = ('cd "$HOME" 2>/dev/null; '
+             'root=$(git rev-parse --show-toplevel 2>/dev/null) || '
+             'root=$(for d in "$HOME"/*/.git; do dirname "$d"; break; done); '
+             '[ -n "$root" ] || exit 1; '
+             'printf "%s\t%s\t%s\n" "$root" '
+             '"$(git -C "$root" rev-parse --abbrev-ref HEAD)" '
+             '"$(git -C "$root" remote get-url origin 2>/dev/null)"')
+    line = ssh_out(host, probe)
+    if not line or "\t" not in line:
+        return None, None, None
+    root, branch, origin = (line.split("\t") + ["", ""])[:3]
+    return root.strip(), branch.strip(), repo_slug(origin)
+
+
+def mirror_session(name, conf, focus=False):
+    """Reproduce the session's checkout locally and return its herdr workspace.
+
+    Returns (workspace_id, checkout_path) or (None, None) when the session's repo
+    has no local clone -- the caller then falls back to a plain workspace.
+
+    The mirror carries the session's commits *and* its uncommitted work, which is
+    the state a review tool needs and no PR view can show. It is derived, never
+    authored in: a refresh resets it.
+    """
+    host = f"{name}{conf['host_suffix']}"
+    repo, branch, slug = remote_repo(host)
+    if not repo or not branch:
+        return None, None
+    clone = clone_path(slug, conf["clone_root"])
+    if not clone:
+        print(f"no local clone for {slug or 'the session repo'} under "
+              f"{conf['clone_root']} -- skipping the mirror")
+        return None, None
+
+    # A named local branch, not a detached ref: reviewr's PR tab resolves the PR
+    # from the current branch name, the same answer `gh pr view` gives. Forced,
+    # because agents amend and rebase.
+    scratch = f"refs/coder/{name}"
+    run(["git", "-C", clone, "fetch", "-q", f"{host}:{repo}", f"+HEAD:{scratch}"])
+    head = run(["git", "-C", clone, "rev-parse", scratch]).strip()
+
+    checkout = worktree_for(clone, branch)
+    if checkout:
+        if not is_mirror(checkout):
+            sys.exit(f"{checkout} is a worktree for {branch} but not a mirror "
+                     f"(no {MIRROR_MARK} marker); refusing to reset work that is not mine")
+        run(["git", "-C", checkout, "reset", "-q", "--hard", head])
+        run(["git", "-C", checkout, "clean", "-qfd"])
+        workspace = workspace_for_path(checkout)
+        if workspace is None:
+            workspace = herdr("worktree", "open", "--cwd", clone, "--branch", branch,
+                              *(("--focus",) if focus else ("--no-focus",))
+                              )["result"]["workspace"]["workspace_id"]
+    else:
+        run(["git", "-C", clone, "branch", "-f", branch, head])
+        created = herdr("worktree", "create", "--cwd", clone, "--branch", branch,
+                        *(("--focus",) if focus else ("--no-focus",)))["result"]
+        workspace = created["workspace"]["workspace_id"]
+        checkout = created["workspace"]["worktree"]["checkout_path"]
+        open(mirror_marker(checkout), "w").close()
+
+    # herdr creates a branch at the clone's HEAD unless told otherwise, so never
+    # trust the name alone -- check the commit.
+    landed = run(["git", "-C", checkout, "rev-parse", "HEAD"]).strip()
+    if landed != head:
+        sys.exit(f"mirror landed on {landed[:12]}, expected {head[:12]} -- "
+                 f"refusing to review the wrong commits")
+
+    apply_session_changes(host, repo, checkout)
+    print(f"mirrored {name} at {checkout} ({branch} @ {head[:12]})")
+    return workspace, checkout
+
+
+def worktree_for(clone, branch):
+    """Path of an existing worktree checked out on `branch`, if any."""
+    listing = run(["git", "-C", clone, "worktree", "list", "--porcelain"])
+    path = None
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.strip() == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
+def workspace_for_path(checkout):
+    """The herdr workspace whose worktree is this checkout, if it is open."""
+    for w in herdr("workspace", "list").get("result", {}).get("workspaces", []):
+        if (w.get("worktree") or {}).get("checkout_path") == checkout:
+            return w["workspace_id"]
+    return None
+
+
+def apply_session_changes(host, repo, checkout):
+    """Copy the session's uncommitted work onto the mirror.
+
+    Two pieces, because `git diff HEAD` covers tracked files only and a new file
+    is usually the point of a change. `git add -N` on the session would show up
+    in the agent's own status, so it is deliberately not used.
+    """
+    patch = ssh_out(host, f'git -C {shlex.quote(repo)} diff HEAD')
+    if patch:
+        proc = subprocess.run(["git", "-C", checkout, "apply", "-"],
+                              input=patch + "\n", text=True, capture_output=True)
+        if proc.returncode != 0:
+            print(f"warning: could not apply the session's tracked changes: "
+                  f"{proc.stderr.strip()[:200]}")
+    listing = ssh_out(host, f'cd {shlex.quote(repo)} && '
+                            'git ls-files -o --exclude-standard')
+    untracked = [f for f in listing.splitlines() if f.strip()]
+    if untracked:
+        tar = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=20", "-o", "BatchMode=yes", host,
+             f'cd {shlex.quote(repo)} && git ls-files -o --exclude-standard -z '
+             '| tar -czf - --null -T -'],
+            capture_output=True)
+        if tar.returncode == 0 and tar.stdout:
+            subprocess.run(["tar", "-xzf", "-", "-C", checkout],
+                           input=tar.stdout, capture_output=True)
+    bits = []
+    if patch:
+        bits.append("tracked changes")
+    if untracked:
+        bits.append(f"{len(untracked)} untracked file(s)")
+    print("  uncommitted: " + (", ".join(bits) or "none"))
+
+
 def open_workspaces():
     """Coder session name -> herdr workspace id.
 
@@ -252,10 +433,20 @@ def open_session(name, sessions=None):
     conf = settings()
     session = next(s for s in sessions if s["name"] == name)
     label = workspace_label(session)
-    created = herdr("workspace", "create", "--label", label,
-                    "--cwd", os.path.expanduser("~"), "--no-focus")["result"]
-    workspace = created["workspace"]["workspace_id"]
-    top = created["root_pane"]["pane_id"]
+
+    workspace = checkout = None
+    if conf.get("mirror", True):
+        workspace, checkout = mirror_session(name, conf)
+    if workspace:
+        # The worktree workspace is the session's workspace: herdr gives it the
+        # branch line in the sidebar, and reviewr auto-opens on worktree.created.
+        herdr("workspace", "rename", workspace, label)
+        top = herdr("pane", "list", "--workspace", workspace)["result"]["panes"][0]["pane_id"]
+    else:
+        created = herdr("workspace", "create", "--label", label,
+                        "--cwd", os.path.expanduser("~"), "--no-focus")["result"]
+        workspace = created["workspace"]["workspace_id"]
+        top = created["root_pane"]["pane_id"]
     # The Coder session name goes in a metadata token, not the label: it is the
     # identifier, shown under the human-readable name, and it is what
     # open_workspaces() matches on.
@@ -336,6 +527,14 @@ def selftest():
     assert readable_name(sess()) == "example-task-4f21"  # nothing to go on
     assert readable_name(sess(display_name="encoded as UTF-8 here")) == "encoded as UTF-8 here"
 
+    assert repo_slug("git@github.com:Photoroom/content_backend.git") == "Photoroom/content_backend"
+    assert repo_slug("https://github.com/Photoroom/content_backend.git") == "Photoroom/content_backend"
+    assert repo_slug("https://github.com/Photoroom/content_backend") == "Photoroom/content_backend"
+    assert repo_slug("ssh://git@github.com/Photoroom/content_backend.git") == "Photoroom/content_backend"
+    assert repo_slug("") is None
+    assert clone_path(None, "~/projects/github") is None
+    assert clone_path("Nope/nope", "~/projects/github") is None
+
     assert workspace_label(sess(display_name="tackle PROJ-42")) \
         == "C■ PROJ-42 · example-task-4f21"
     assert workspace_label(sess()) == "C■ example-task-4f21"  # no better name to use
@@ -348,6 +547,8 @@ def selftest():
 def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("--selftest", action="store_true", help="check the pure helpers")
+    parser.add_argument("--mirror", metavar="NAME",
+                        help="refresh one session's local mirror worktree, no panes")
     parser.add_argument("--relabel", action="store_true",
                         help="re-apply the current label scheme to open Coder workspaces")
     parser.add_argument("--pane", action="store_true",
@@ -359,6 +560,9 @@ def main():
 
     if args.selftest:
         return selftest()
+
+    if args.mirror:
+        return mirror_session(args.mirror, settings(), focus=False)
 
     if args.relabel:
         return relabel()
