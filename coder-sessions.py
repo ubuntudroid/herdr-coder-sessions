@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Browse running Coder agent sessions and open each as its own herdr workspace.
+
+Coder task workspaces have no tmux: the agent runs under agentapi on port 3284.
+Picking a session opens a workspace holding `agentty` on top (two thirds of the
+height) and a plain ssh shell below it. Picking a session that is already open
+focuses its workspace instead of building a second one.
+
+    coder-sessions.py                  fzf picker (the plugin's pane and action)
+    coder-sessions.py --list           print the rows, no picker
+    coder-sessions.py --open NAME      open or focus one session's workspace
+    coder-sessions.py --show NAME      preview text for one session
+    coder-sessions.py --relabel        re-apply the label scheme to open workspaces
+    coder-sessions.py --selftest       check the naming helpers
+
+`coder task list` costs ~700ms, too slow to run per keystroke, so --list writes
+a cache that --show reads back.
+
+Settings, all optional, in $HERDR_PLUGIN_CONFIG_DIR/config.json:
+
+    {"ratio": 0.667, "host_suffix": ".coder"}
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+
+# Runtime state belongs in the state dir herdr provides, never in the plugin
+# root: a GitHub install replaces that checkout wholesale.
+CACHE = os.path.join(os.environ.get("HERDR_PLUGIN_STATE_DIR") or tempfile.gettempdir(),
+                     f"coder-sessions-{os.getuid()}.json")
+SELF = os.path.abspath(__file__)
+
+DEFAULTS = {
+    "ratio": 0.667,        # share of the height for the top pane: agentty
+    "host_suffix": ".coder",  # ssh host is <session name> + this
+}
+
+DIM, BOLD, RESET = "\x1b[2m", "\x1b[1m", "\x1b[0m"
+STATE_COLOR = {"idle": "\x1b[32m", "working": "\x1b[33m",
+               "complete": "\x1b[32m", "failure": "\x1b[31m", "error": "\x1b[31m"}
+
+
+def settings():
+    path = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    merged = dict(DEFAULTS)
+    if path:
+        try:
+            with open(os.path.join(path, "config.json")) as handle:
+                merged.update(json.load(handle))
+        except (OSError, ValueError):
+            pass  # absent or malformed config just means defaults
+    return merged
+
+
+def run(argv, check=True):
+    """Run a command, returning stdout. stderr is dropped: the coder CLI prints
+    a version-mismatch warning there on every call."""
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        sys.exit(f"{argv[0]} failed: {(proc.stderr or proc.stdout).strip()[:300]}")
+    return proc.stdout
+
+
+def herdr(*args):
+    out = run([HERDR, *args]).strip()
+    if not out:
+        return {}  # mutators such as `pane run` answer with nothing on success
+    try:
+        return json.loads(out)
+    except ValueError:
+        sys.exit(f"herdr {' '.join(args)} returned no JSON: {out[:200]}")
+
+
+def agentty_cmd():
+    """Prefer the agentty shipped next to this script over one on PATH.
+
+    The pane must run the copy this plugin was installed with -- a PATH lookup
+    would silently pick up a different version, or nothing at all.
+    """
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentty")
+    if os.access(local, os.X_OK):
+        return shlex.quote(local)
+    if shutil.which("agentty"):
+        return "agentty"
+    sys.exit("agentty not found: expected it beside this script or on PATH")
+
+
+def running_sessions(running_only=True):
+    """Coder tasks. By default only those whose workspace is up, so agentapi is
+    reachable; pass False when naming workspaces, where a stopped session's
+    ticket is still the best label."""
+    out = run(["coder", "task", "list", "-o", "json"])
+    start = out.find("[")
+    tasks = json.loads(out[start:]) if start >= 0 else []
+    if not running_only:
+        return tasks
+    return [t for t in tasks if t.get("workspace_status") == "running"]
+
+
+METADATA_SOURCE = "coder-sessions"
+TOKEN = "coder"
+
+# Ticket ids make the best workspace label. Prefixes here carry digits (CON2,
+# PGROWTH), so allow them after the first letter; skip encodings and standards
+# that share the shape.
+TICKET_RE = re.compile(r"\b(?!UTF-|ISO-|RFC-|SHA-)[A-Z][A-Z0-9]{1,9}-\d{1,5}\b")
+SLACK_MARKUP = re.compile(r"<[^>]*>|<[^>]*$")  # <@U123>, <https://x|text>, truncated
+
+
+def readable_name(session, limit=28):
+    """A human label for the workspace: the ticket id if the task names one,
+    else the task's own display name with Slack markup stripped."""
+    haystack = " ".join(filter(None, (session.get("display_name"),
+                                      session.get("message"), session.get("prompt"))))
+    found = TICKET_RE.search(haystack)
+    if found:
+        return found.group(0)
+    text = " ".join(SLACK_MARKUP.sub(" ", session.get("display_name") or "").split())
+    if not text:
+        return session["name"]
+    return text[:limit].rstrip() + "…" if len(text) > limit else text
+
+
+ICON = "C■"  # stands in for the Coder logo: these workspaces mirror a Coder one
+SIDEBAR_MAX = 36  # `sidebar_max_width` default; the sidebar auto-scales up to it
+
+
+def workspace_label(session):
+    """`C■ <ticket or summary> · <session name>`, kept inside the sidebar width.
+
+    The sidebar shows one line per workspace: the branch line on worktree
+    workspaces is herdr's own, `--cwd` inside a repo does not earn one, and
+    metadata tokens never render -- so the identifier has to share the label.
+    """
+    name = session["name"]
+    # icon + its space + " · " + a column for "…" on a truncated summary
+    head = readable_name(session, limit=max(8, SIDEBAR_MAX - len(ICON) - len(name) - 5))
+    if head == name:
+        return f"{ICON} {name}"  # nothing better to say than the name itself
+    return f"{ICON} {head} · {name}"
+
+
+def open_workspaces():
+    """Coder session name -> herdr workspace id.
+
+    Keyed off the metadata token this plugin stamps, so the label stays free to
+    be human-readable; the label is a fallback for workspaces made before that.
+    """
+    result = herdr("workspace", "list").get("result", {})
+    found = {}
+    for w in result.get("workspaces", []):
+        name = (w.get("tokens") or {}).get(TOKEN) or w.get("label", "")
+        if name:
+            found.setdefault(name, w["workspace_id"])
+    return found
+
+
+def age(stamp):
+    if not stamp:
+        return "-"
+    try:
+        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return "-"
+    secs = (datetime.now(timezone.utc) - then).total_seconds()
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if secs >= size:
+            return f"{int(secs // size)}{unit}"
+    return f"{int(secs)}s"
+
+
+def describe(task):
+    state = task.get("current_state") or {}
+    return {
+        "name": task.get("name", "?"),
+        "display_name": (task.get("display_name") or "").strip(),
+        "status": task.get("status", "?"),
+        "state": state.get("state") or "-",
+        "message": (state.get("message") or "").replace("\n", " ").strip(),
+        "uri": state.get("uri") or "",
+        "age": age(state.get("timestamp") or task.get("updated_at")),
+        "template": task.get("template_name", "?"),
+        "prompt": (task.get("initial_prompt") or "").strip(),
+    }
+
+
+def rows(sessions, opened, width):
+    """One fzf line per session: plain name, TAB, then the display columns."""
+    out = []
+    for s in sessions:
+        mark = "●" if s["name"] in opened else " "
+        head = f"{mark} {BOLD}{s['name']:<22}{RESET}"
+        colour = STATE_COLOR.get(s["state"], "")
+        state = f"{colour}{s['state']:<8}{RESET}"
+        meta = f"{s['age']:>4} {DIM}{s['template']}{RESET}"
+        # 46 covers the escape-free width of the columns above
+        room = max(10, width - 46 - len(s["name"]))
+        msg = s["message"][:room] + ("…" if len(s["message"]) > room else "")
+        out.append(f"{s['name']}\t{head} {state} {meta}  {msg}")
+    return out
+
+
+def preview(session):
+    lines = [f"{BOLD}{session['name']}{RESET}   {session['template']}",
+             f"task status : {session['status']}",
+             f"agent state : {session['state']}  ({session['age']} ago)"]
+    if session["uri"]:
+        lines.append(f"link        : {session['uri']}")
+    if session["message"]:
+        lines += ["", f"{BOLD}Last report{RESET}", session["message"]]
+    if session["prompt"]:
+        lines += ["", f"{BOLD}Initial prompt{RESET}", session["prompt"][:1200]]
+    return "\n".join(lines)
+
+
+def cache_write(sessions):
+    with open(CACHE, "w") as handle:
+        json.dump(sessions, handle)
+
+
+def cache_read():
+    try:
+        with open(CACHE) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+
+def open_session(name, sessions=None):
+    """Focus this session's workspace, building it the first time."""
+    existing = open_workspaces().get(name)
+    if existing:
+        herdr("workspace", "focus", existing)
+        print(f"focused existing workspace {existing} for {name}")
+        return
+
+    sessions = sessions if sessions is not None else [describe(t) for t in running_sessions()]
+    if name not in {s["name"] for s in sessions}:
+        sys.exit(f"{name} is not a running Coder session "
+                 f"(start it with: coder start {name})")
+
+    conf = settings()
+    session = next(s for s in sessions if s["name"] == name)
+    label = workspace_label(session)
+    created = herdr("workspace", "create", "--label", label,
+                    "--cwd", os.path.expanduser("~"), "--no-focus")["result"]
+    workspace = created["workspace"]["workspace_id"]
+    top = created["root_pane"]["pane_id"]
+    # The Coder session name goes in a metadata token, not the label: it is the
+    # identifier, shown under the human-readable name, and it is what
+    # open_workspaces() matches on.
+    herdr("workspace", "report-metadata", workspace,
+          "--source", METADATA_SOURCE, "--token", f"{TOKEN}={name}")
+
+    # Split while both panes are still bare shells. Starting agentty first would
+    # only make it repaint at a new size, and a `pane run` aimed at a pane that
+    # already hosts agentty types into the agent's composer instead.
+    bottom = herdr("pane", "split", top, "--direction", "down",
+                   "--ratio", str(conf["ratio"]), "--no-focus")["result"]["pane"]["pane_id"]
+    host = f"{name}{conf['host_suffix']}"
+    herdr("pane", "run", top, f"{agentty_cmd()} {host}")
+    herdr("pane", "run", bottom, f"ssh {host}")
+    herdr("workspace", "focus", workspace)
+    print(f"opened {workspace} \"{label}\" for {name}: agentty in {top}, ssh in {bottom}")
+
+
+def pick(sessions):
+    if not shutil.which("fzf"):
+        sys.exit("fzf is not installed; use --list and --open NAME")
+    width = shutil.get_terminal_size((120, 40)).columns
+    proc = subprocess.run(
+        ["fzf", "--ansi", "--delimiter=\t", "--with-nth=2..",
+         "--header=enter: open or focus    ctrl-r: refresh    ● already open",
+         "--preview", f"{SELF} --show {{1}}",
+         "--preview-window=right,50%,wrap",
+         "--bind", f"ctrl-r:reload({SELF} --list)"],
+        input="\n".join(rows(sessions, open_workspaces(), width)),
+        text=True, capture_output=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.split("\t", 1)[0].strip()
+
+
+def relabel():
+    """Bring every Coder workspace up to the current label scheme.
+
+    Idempotent, and it also stamps the metadata token on workspaces opened
+    before that existed -- those are recognised by their label still being the
+    bare session name.
+    """
+    known = {s["name"]: s for s in (describe(t) for t in running_sessions(False))}
+    changes = 0
+    for w in herdr("workspace", "list").get("result", {}).get("workspaces", []):
+        tokens = w.get("tokens") or {}
+        name = tokens.get(TOKEN) or w.get("label", "")
+        session = known.get(name)
+        if not session:
+            continue
+        wanted = workspace_label(session)
+        if w.get("label") != wanted:
+            herdr("workspace", "rename", w["workspace_id"], wanted)
+            print(f"{w['workspace_id']}: {w.get('label')!r} -> {wanted!r}")
+            changes += 1
+        if tokens.get(TOKEN) != name:
+            herdr("workspace", "report-metadata", w["workspace_id"],
+                  "--source", METADATA_SOURCE, "--token", f"{TOKEN}={name}")
+            print(f"{w['workspace_id']}: tagged {TOKEN}={name}")
+            changes += 1
+    if not changes:
+        print("every Coder workspace label is already current")
+
+
+def selftest():
+    def sess(**kw):
+        base = {"name": "example-task-4f21", "display_name": "", "message": "", "prompt": ""}
+        base.update(kw)
+        return base
+
+    assert readable_name(sess(display_name="tackle PROJ-42")) == "PROJ-42"
+    assert readable_name(sess(display_name="<@U0B9X> get cracking on TEAM2-7")) == "TEAM2-7"
+    assert readable_name(sess(message="Rebased PROJ-1234 onto main")) == "PROJ-1234"
+    # no ticket: Slack mentions and links go, including a truncated one
+    assert readable_name(sess(display_name="<@U08B> I got the issue in the <https://cod")) \
+        == "I got the issue in the"
+    assert readable_name(sess(display_name="a" * 40)) == "a" * 28 + "…"
+    assert readable_name(sess()) == "example-task-4f21"  # nothing to go on
+    assert readable_name(sess(display_name="encoded as UTF-8 here")) == "encoded as UTF-8 here"
+
+    assert workspace_label(sess(display_name="tackle PROJ-42")) \
+        == "C■ PROJ-42 · example-task-4f21"
+    assert workspace_label(sess()) == "C■ example-task-4f21"  # no better name to use
+    long = workspace_label(sess(display_name="a really long summary with no ticket in it"))
+    assert long == "C■ a really lon… · example-task-4f21", long
+    assert len(long) <= SIDEBAR_MAX, (long, len(long))
+    print("selftest ok")
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=True, description=__doc__)
+    parser.add_argument("--selftest", action="store_true", help="check the pure helpers")
+    parser.add_argument("--relabel", action="store_true",
+                        help="re-apply the current label scheme to open Coder workspaces")
+    parser.add_argument("--pane", action="store_true",
+                        help="open the picker as a plugin pane (what the action does)")
+    parser.add_argument("--list", action="store_true", help="print rows, no picker")
+    parser.add_argument("--open", metavar="NAME", help="open or focus a session")
+    parser.add_argument("--show", metavar="NAME", help="preview text for a session")
+    args = parser.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    if args.relabel:
+        return relabel()
+
+    if args.pane:
+        # An action's command runs with no terminal, so it cannot host fzf --
+        # it has to ask herdr for a pane, which does have one.
+        herdr("plugin", "pane", "open",
+              "--plugin", os.environ.get("HERDR_PLUGIN_ID", "ubuntudroid.coder-sessions"),
+              "--entrypoint", "list")
+        return
+
+    if args.show:  # fzf preview: read the cache, never the slow CLI
+        for session in cache_read():
+            if session["name"] == args.show:
+                print(preview(session))
+                return
+        print(f"{args.show}: not in cache; press ctrl-r to refresh")
+        return
+
+    if args.open:
+        open_session(args.open)
+        return
+
+    sessions = [describe(t) for t in running_sessions()]
+    cache_write(sessions)
+    if not sessions:
+        print("no running Coder sessions")
+        return
+
+    if args.list:
+        width = shutil.get_terminal_size((120, 40)).columns
+        print("\n".join(rows(sessions, open_workspaces(), width)))
+        return
+
+    chosen = pick(sessions)
+    if chosen:
+        open_session(chosen, sessions)
+
+
+if __name__ == "__main__":
+    main()

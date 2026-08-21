@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""Scrollable replacement for `agentapi attach`.
+
+agentapi's own attach renders the server's whole screen into an alt-screen
+buffer with no viewport, so nothing scrolls. This keeps the same two
+primitives -- SSE GET /internal/screen for the screen, POST /message
+{"type":"raw"} for keystrokes -- and adds a local viewport.
+
+    agentty <workspace-ssh-host>   # opens its own ssh tunnel to 3284
+    agentty localhost:3284         # already-forwarded port
+
+PgUp/PgDn/Home/End scroll locally and are never sent to the agent.
+Every other key goes to the agent unchanged. Ctrl+] quits.
+"""
+
+import json
+import os
+import queue
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import urllib.request
+
+SCROLL_KEYS = {
+    b"\x1b[5~": "pgup",
+    b"\x1b[6~": "pgdn",
+    b"\x1b[H": "home",
+    b"\x1b[F": "end",
+    b"\x1bOH": "home",
+    b"\x1bOF": "end",
+}
+QUIT = b"\x1d"  # Ctrl+]
+
+# SGR mouse reporting: ESC [ < button ; col ; row M|m
+MOUSE_RE = re.compile(rb"\x1b\[<(\d+);\d+;\d+[Mm]")
+MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1006l\x1b[?1000l"
+WHEEL_LINES = 3
+
+
+def strip_mouse(data):
+    """Pull mouse reports out of `data`. Returns (remaining bytes, wheel notches).
+
+    Positive notches scroll back. Non-wheel mouse events (clicks, drags) are
+    dropped rather than forwarded -- this client owns the terminal, so the
+    agent never asked for them.
+    """
+    notches = 0
+    for match in MOUSE_RE.finditer(data):
+        button = int(match.group(1))
+        if button & 64:  # 64 wheel up, 65 wheel down (+4 with shift, +8 alt)
+            notches += -1 if button & 1 else 1
+    return MOUSE_RE.sub(b"", data), notches
+
+
+class State:
+    def __init__(self):
+        self.lines = ["connecting..."]
+        self.scroll = 0  # lines above the bottom; 0 == follow
+        self.caret_back = 0  # caret offset from the end of the input; None == unknown
+        self.pred = None  # (server's line when we started, edited line, deadline)
+        self.width = 0  # the agent's terminal width, read off the padded screen
+        self.dirty = True
+        self.stop = False
+        self.error = ""
+        self.lock = threading.Lock()
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def open_tunnel(host, remote_port):
+    """ssh -N -L <local>:127.0.0.1:<remote_port> host. Returns (proc, local_port)."""
+    local = free_port()
+    proc = subprocess.Popen(
+        ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+         "-L", f"{local}:127.0.0.1:{remote_port}", host],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    for _ in range(100):  # wait up to 10s for the forward to come up
+        if proc.poll() is not None:
+            err = proc.stderr.read().decode(errors="replace").strip()
+            sys.exit(f"ssh tunnel failed: {err}")
+        try:
+            socket.create_connection(("127.0.0.1", local), 0.2).close()
+            return proc, local
+        except OSError:
+            time.sleep(0.1)
+    proc.terminate()
+    sys.exit("ssh tunnel did not come up in 10s")
+
+
+HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
+HERDR_PANE = os.environ.get("HERDR_PANE_ID")
+# agentapi's AgentStatus is only stable|running, so there is no blocked state to
+# mirror; an agent_error event is surfaced as unknown plus its message.
+HERDR_STATE = {"running": "working", "stable": "idle"}
+
+
+def agent_label(target):
+    """A herdr agent name for this session: [a-z][a-z0-9_-]{0,31}."""
+    stem = re.sub(r"[^a-z0-9_-]+", "-", target.split(":")[0].split(".")[0].lower())
+    stem = stem.strip("-") or "agentapi"
+    return (stem if stem[0].isalpha() else "a" + stem)[:32]
+
+
+def report_agent(label, state, seq, message=None):
+    """Mirror the agent's status onto herdr's dot for the pane we run in."""
+    argv = [HERDR_BIN, "pane", "report-agent", HERDR_PANE, "--source", "agentty",
+            "--agent", label, "--state", state, "--seq", str(seq)]
+    if message:
+        argv += ["--message", message[:200]]
+    subprocess.run(argv, capture_output=True)
+
+
+def watch_status(base, label, st):
+    """Report the agent's status to herdr: once from /status, then on each change."""
+    seq = 0
+    while not st.stop:
+        try:
+            with urllib.request.urlopen(base + "/status") as resp:
+                status = json.load(resp).get("status")
+            seq += 1
+            report_agent(label, HERDR_STATE.get(status, "unknown"), seq)
+            with urllib.request.urlopen(base + "/events") as resp:
+                event = None
+                for raw in resp:
+                    if st.stop:
+                        return
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("event:"):
+                        event = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:") and event in ("status_change",
+                                                                "agent_error"):
+                        try:
+                            payload = json.loads(line[5:].strip())
+                        except ValueError:
+                            continue
+                        seq += 1
+                        if event == "agent_error":
+                            report_agent(label, "unknown", seq,
+                                         payload.get("message") or "agent error")
+                        else:
+                            report_agent(label,
+                                         HERDR_STATE.get(payload.get("status"), "unknown"),
+                                         seq)
+        except Exception:
+            time.sleep(2)  # server restart or tunnel blip; try again
+
+
+def read_screen(base, st):
+    """Consume the SSE stream, keeping the latest screen in st.lines."""
+    while not st.stop:
+        try:
+            with urllib.request.urlopen(base + "/internal/screen") as resp:
+                for raw in resp:
+                    if st.stop:
+                        return
+                    if not raw.startswith(b"data:"):
+                        continue
+                    try:
+                        payload = json.loads(raw[5:].strip() or b"{}")
+                    except ValueError:
+                        continue
+                    screen = payload.get("screen")
+                    if screen is None:
+                        continue
+                    lines = screen.split("\n")
+                    while lines and not lines[-1].strip():
+                        lines.pop()
+                    lines = lines or [""]
+                    caret = input_cursor(lines)
+                    if caret:
+                        lines[caret[0]] = strip_placeholder(lines[caret[0]])
+                    width = max((len(line) for line in lines), default=0)
+                    with st.lock:
+                        st.lines = lines
+                        st.width = width
+                        if st.pred:
+                            anchor = lines[caret[0]] if caret else None
+                            if not predictable(anchor, st.pred[1], width):
+                                st.pred = None  # composer wrapped, or moved
+                            elif composer_text(anchor) == composer_text(st.pred[1]):
+                                pass  # server agrees; keep it -- the echo also
+                                # carries trailing spaces the padded screen
+                                # cannot show
+                            elif time.monotonic() > st.pred[2]:
+                                st.pred = None  # done waiting; server wins
+                        st.error = ""
+                        st.dirty = True
+        except Exception as exc:  # server restart, tunnel blip
+            with st.lock:
+                st.error = f"reconnecting: {exc}"
+                st.dirty = True
+            time.sleep(1)
+
+
+def send_keys(base, data):
+    req = urllib.request.Request(
+        base + "/message",
+        data=json.dumps({"type": "raw", "content": data.decode("utf-8", "replace")}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10).close()
+
+
+# Caret tracking. The screen arrives as plain text with no cursor position, but
+# this client sends every keystroke, so it can follow the insertion point as an
+# offset from the end of the composer text. Offset-from-end is the useful frame:
+# inserting or backspacing before the caret leaves it unchanged.
+CARET_MOVE = {
+    b"\x1b[D": 1, b"\x1bOD": 1,    # Left
+    b"\x1b[C": -1, b"\x1bOC": -1,  # Right
+}
+CARET_TO_END = (b"\r", b"\n", b"\x05", b"\x0b",  # Enter, Ctrl+E, Ctrl+K
+                b"\x1b[A", b"\x1bOA", b"\x1b[B", b"\x1bOB")  # history recall
+
+
+def apply_edit(text, back, data):
+    """Apply one keystroke to the input line locally. None if we can't predict it.
+
+    The round trip to the agent is ~600ms on a remote workspace, so without this
+    a keystroke looks like it did nothing -- most visibly a lone backspace.
+    """
+    at = len(text) - back
+    floor = prompt_prefix(text)
+    if at < floor:
+        return None
+    if data == b"\x7f":  # backspace
+        return text[:at - 1] + text[at:] if at > floor else text
+    try:
+        typed = data.decode()
+    except UnicodeDecodeError:
+        return None
+    if not typed or any(ord(c) < 32 or ord(c) == 127 for c in typed):
+        return None  # control keys: let the agent decide what they mean
+    return text[:at] + typed + text[at:]
+
+
+def predictable(anchor, pred_text, width):
+    """Whether a predicted line can still be painted onto the agent's composer.
+
+    False once the input outgrows the agent's own width: the agent folds it, and
+    the fold's second line carries no prompt marker, so painting the predicted
+    line there would repeat the "›". Also false if the anchor moved to such a
+    continuation line.
+
+    ponytail: width comes from the widest screen line, which is exact only
+    because the server pads every line out to the terminal width.
+    """
+    if anchor is None or pred_text is None:
+        return False
+    return (prompt_prefix(anchor) == prompt_prefix(pred_text)
+            and len(pred_text) <= width)
+
+
+def track_caret(data, back):
+    """Update the caret's offset from the end of the input. None == unknown."""
+    if data in CARET_TO_END:
+        return 0
+    delta = CARET_MOVE.get(data)
+    if delta is not None:
+        return None if back is None else max(0, back + delta)
+    if b"\x1b" in data or b"\x01" in data:
+        return None  # a movement we don't model (Alt+arrows, Ctrl+A, ...)
+    return back  # typing and backspace both leave the offset from the end alone
+
+
+RULE_RE = re.compile(r"^[─━┄┅-]{10,}$")
+MARKERS = "›>❯$#|"
+
+# The agent draws a hint in the empty composer ("Ask Codex to do anything").
+# It is not input, so it must not be echoed into, edited, or deleted first.
+PLACEHOLDER_RE = re.compile(
+    os.environ.get("AGENTTY_PLACEHOLDER")
+    or r"(?i)^(ask \w+ (to|a) .*|ask a follow-up question|type a message.*)$")
+
+# How long a local echo may outlive the server disagreeing with it. Long enough
+# to cover a couple of round trips, so a burst never appears to replay itself.
+ECHO_GRACE = 1.2
+
+
+def prompt_prefix(line):
+    """Length of the prompt itself (indent + marker + its one space), else 0.
+
+    Distinct from trailing screen padding: the server pads every line out to the
+    terminal width, but the space after "›" belongs to the prompt and must
+    survive, or typing into an empty composer loses it.
+    """
+    i = 0
+    while i < len(line) and line[i] == " ":
+        i += 1
+    j = i
+    while j < len(line) and line[j] in MARKERS:
+        j += 1
+    if j == i:
+        return 0
+    return j + 1 if j < len(line) and line[j] == " " else j
+
+
+def composer_text(line):
+    """Drop the screen's right-hand padding, keep the prompt's own spacing."""
+    at = prompt_prefix(line)
+    return line[:at] + line[at:].rstrip()
+
+
+def strip_placeholder(line):
+    """Replace the composer hint with a bare prompt, so it reads as empty."""
+    at = prompt_prefix(line)
+    if at and PLACEHOLDER_RE.match(line[at:].strip()):
+        return line[:at]
+    return line
+
+
+def input_cursor(lines):
+    """Guess (row, col) of the agent's input caret. None if there isn't one.
+
+    ponytail: a heuristic, because the server sends plain screen text and no
+    cursor position (ScreenUpdateBody is {"screen": string}, nothing else).
+    Codex and Claude Code both draw a horizontal rule above the composer and a
+    status line at the very bottom, so the caret sits after the last text
+    between the two. Any other layout gets no cursor, which is today's
+    behaviour anyway.
+    """
+    rule = None
+    for i in range(len(lines) - 1, -1, -1):
+        if RULE_RE.match(lines[i].strip()):
+            rule = i
+            break
+    if rule is None:
+        return None
+    footer = None
+    for i in range(len(lines) - 1, rule, -1):
+        if lines[i].strip():
+            footer = i
+            break
+    end = footer if footer is not None else len(lines)
+    row = None
+    for i in range(rule + 1, end):
+        if lines[i].strip():
+            row = i
+    if row is None:
+        row = rule + 1
+        if row >= end:
+            return None
+    return row, max(len(lines[row].rstrip()), prompt_prefix(lines[row]))
+
+
+def wrap_lines(lines, cols, caret=None):
+    """Fold lines to the pane width; map an absolute caret into folded coords.
+
+    The agent's terminal is whatever width the server started it at and there is
+    no resize endpoint, so a pane narrower than that has to fold rather than cut.
+    """
+    wrapped = []
+    mapped = None
+    for i, line in enumerate(lines):
+        segs = [line[j:j + cols] for j in range(0, len(line), cols)] or [""]
+        if caret and caret[0] == i:
+            row, col = divmod(caret[1], cols)
+            if row >= len(segs):  # caret just past a line that fills the width
+                row, col = len(segs) - 1, min(len(segs[-1]), cols - 1)
+            mapped = (len(wrapped) + row, col)
+        wrapped.extend(segs)
+    return wrapped, mapped
+
+
+def viewport(lines, body, scroll):
+    """Slice `body` lines out of the screen, `scroll` lines up from the bottom.
+
+    ponytail: the offset is anchored to the bottom, so new output shifts the
+    view while you are scrolled up. Anchor to a line index if that annoys.
+    """
+    top = max(0, len(lines) - body - scroll)
+    return lines[top:top + body], top, max(0, len(lines) - top - body)
+
+
+def selftest():
+    lines = [str(i) for i in range(100)]
+    view, above, below = viewport(lines, 10, 0)
+    assert view == [str(i) for i in range(90, 100)], view
+    assert (above, below) == (90, 0)
+    view, above, below = viewport(lines, 10, 25)
+    assert view == [str(i) for i in range(65, 75)], view
+    assert (above, below) == (65, 25)
+    view, above, below = viewport(lines, 10, 10**9)  # clamped by max(0, ...)
+    assert view == [str(i) for i in range(0, 10)], view
+    assert (above, below) == (0, 90)
+    view, _, _ = viewport(["a"], 10, 0)  # screen shorter than the window
+    assert view == ["a"], view
+
+    assert strip_mouse(b"\x1b[<64;10;20M") == (b"", 1)          # wheel up
+    assert strip_mouse(b"\x1b[<65;10;20M") == (b"", -1)         # wheel down
+    assert strip_mouse(b"\x1b[<68;1;1M") == (b"", 1)            # shift+wheel up
+    assert strip_mouse(b"\x1b[<0;5;5M\x1b[<0;5;5m") == (b"", 0)  # click, dropped
+    assert strip_mouse(b"hi\x1b[<64;1;1Mthere") == (b"hithere", 1)  # mixed read
+    assert strip_mouse(b"\x1b[5~") == (b"\x1b[5~", 0)           # PgUp untouched
+
+    rule = "─" * 40
+    footer = "  some-model high · ~/example-repo · Main"
+    assert input_cursor(["out", rule, "› update the branch", "", footer]) == (2, 19)
+    assert input_cursor(["out", rule, "", "", footer]) == (2, 0)  # empty composer
+    assert input_cursor(["just", "output", "no rule"]) is None
+    # a rule inside the transcript must not win over the composer's rule
+    assert input_cursor(["a", rule, "b", rule, "› hi", footer]) == (4, 4)
+
+    assert track_caret(b"x", 0) == 0            # typing at the end stays at the end
+    assert track_caret(b"\x1b[D", 0) == 1       # Left
+    assert track_caret(b"\x1b[D", 3) == 4
+    assert track_caret(b"\x1b[C", 4) == 3       # Right
+    assert track_caret(b"\x1b[C", 0) == 0       # clamped at the end
+    assert track_caret(b"x", 3) == 3            # insert mid-line: offset unchanged
+    assert track_caret(b"\x7f", 3) == 3         # backspace mid-line: unchanged
+    assert track_caret(b"\r", 5) == 0           # submit returns to the end
+    assert track_caret(b"\x0b", 5) == 0         # Ctrl+K kills to the end
+    assert track_caret(b"\x1b[1;3D", 2) is None  # Alt+Left: unmodelled, so unknown
+    assert track_caret(b"\x1b[C", None) is None  # unknown stays unknown
+    assert track_caret(b"\r", None) == 0         # ...until the next submit
+
+    assert apply_edit("› ab", 0, b"c") == "› abc"       # type at the end
+    assert apply_edit("› abc", 1, b"X") == "› abXc"     # type mid-line
+    assert apply_edit("› abc", 0, b"\x7f") == "› ab"    # backspace at the end
+    assert apply_edit("› abc", 1, b"\x7f") == "› ac"    # backspace mid-line
+    assert apply_edit("›", 0, b"\x7f") == "›"           # nothing left to delete
+    assert apply_edit("› ab", 0, b"\r") is None         # control keys: no guess
+    assert apply_edit("› ab", 0, b"\x1b[D") is None
+
+    assert strip_placeholder("› Ask Codex to do anything") == "› "
+    assert strip_placeholder("› Ask a follow-up question") == "› "
+    assert strip_placeholder("› ask claude to fix it") == "› "  # match is case-insensitive
+    assert strip_placeholder("› real user text") == "› real user text"
+    assert strip_placeholder("  output line") == "  output line"
+
+    pad = " " * 40
+    assert prompt_prefix("› hi" + pad) == 2      # marker plus its one space
+    assert prompt_prefix("›" + pad) == 2
+    assert prompt_prefix("  no marker here") == 0
+    assert composer_text("› " + pad) == "› "     # padding goes, prompt space stays
+    assert composer_text("› hi" + pad) == "› hi"
+    assert apply_edit(composer_text("› " + pad), 0, b"h") == "› h"
+    assert input_cursor(["x", "─" * 40, "› " + pad, footer]) == (2, 2)
+
+    w, c = wrap_lines(["abcdef"], 3, (0, 4))
+    assert w == ["abc", "def"] and c == (1, 1), (w, c)
+    w, c = wrap_lines(["ab", "", "cd"], 10, (2, 2))
+    assert w == ["ab", "", "cd"] and c == (2, 2), (w, c)
+    w, c = wrap_lines(["abc"], 3, (0, 3))  # caret just past a full-width line
+    assert w == ["abc"] and c == (0, 2), (w, c)
+
+    assert predictable("› hi" + " " * 63, "› hit", 67)      # room left
+    assert not predictable("› x" * 30, "› " + "y" * 66, 67)  # echo outgrew the agent
+    assert not predictable("  continuation text", "› typed", 67)  # anchor has no prompt
+    assert not predictable(None, "› typed", 67)
+    assert not predictable("› hi", None, 67)
+    # a typed trailing space is invisible on the padded screen but must not be lost
+    assert composer_text("› hi ") == "› hi"
+    assert apply_edit("› hi ", 0, b"x") == "› hi x"
+    print("selftest ok")
+
+
+def sender(base, outbox, st):
+    """Post keystrokes off the input thread -- the POST costs a full round trip."""
+    while True:
+        data = outbox.get()
+        if data is None:
+            return
+        # Coalesce whatever else is already queued: a burst of keystrokes then
+        # costs one round trip instead of one per key, in order.
+        while True:
+            try:
+                more = outbox.get_nowait()
+            except queue.Empty:
+                break
+            if more is None:
+                outbox.put(None)  # keep the sentinel for the next loop
+                break
+            data += more
+        try:
+            send_keys(base, data)
+        except Exception as exc:
+            with st.lock:
+                st.error = f"send failed: {exc}"
+                st.dirty = True
+
+
+def render(st):
+    cols, rows = os.get_terminal_size()
+    body = rows - 1
+    with st.lock:
+        lines, scroll, err, back = st.lines, st.scroll, st.error, st.caret_back
+        pred, width = st.pred, st.width
+
+    spot = input_cursor(lines)
+    if pred and spot and predictable(lines[spot[0]], pred[1], width or len(pred[1])):
+        lines = list(lines)
+        lines[spot[0]] = pred[1]
+        # Measure the echo, not its rstrip: a trailing space the user just typed
+        # is invisible, but the caret still has to move past it.
+        spot = (spot[0], len(pred[1]))
+
+    caret_abs = None
+    if not scroll and back is not None and spot and back <= spot[1]:
+        caret_abs = (spot[0], spot[1] - back)
+    lines, caret = wrap_lines(lines, cols, caret_abs)
+    view, above, below = viewport(lines, body, scroll)
+
+    if err:
+        status = err
+    elif scroll:
+        status = f"SCROLLED  {above} above / {below} below  PgDn,End to bottom  Ctrl+] quit"
+    else:
+        status = f"live  {above} lines above  wheel/PgUp scroll  Ctrl+] quit"
+
+    out = ["\x1b[?25l\x1b[H\x1b[2J"]
+    out.extend(line + "\x1b[K\r\n" for line in view)
+    out.append("\r\n" * max(0, body - len(view)))
+    out.append("\x1b[7m" + status[:cols].ljust(cols) + "\x1b[0m")
+
+    if caret and above <= caret[0] < above + body:
+        out.append(f"\x1b[{caret[0] - above + 1};{caret[1] + 1}H\x1b[?25h")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def scroll_by(st, delta, absolute=None):
+    cols, rows = os.get_terminal_size()
+    with st.lock:
+        folded = sum(max(1, -(-len(line) // cols)) for line in st.lines)
+        limit = max(0, folded - (rows - 1))
+        st.scroll = absolute if absolute is not None else st.scroll + delta
+        st.scroll = max(0, min(st.scroll, limit))
+        st.dirty = True
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        sys.exit(__doc__)
+    if sys.argv[1] == "--selftest":
+        return selftest()
+    target = sys.argv[1]
+    remote_port = int(sys.argv[2]) if len(sys.argv) > 2 else 3284
+
+    tunnel = None
+    if ":" in target or target in ("localhost", "127.0.0.1"):
+        host, _, port = target.partition(":")
+        base = f"http://{host}:{port or remote_port}"
+    else:
+        tunnel, local = open_tunnel(target, remote_port)
+        base = f"http://127.0.0.1:{local}"
+
+    st = State()
+    echo = not os.environ.get("AGENTTY_NO_ECHO")
+    outbox = queue.Queue()
+    threading.Thread(target=read_screen, args=(base, st), daemon=True).start()
+    threading.Thread(target=sender, args=(base, outbox, st), daemon=True).start()
+
+    # Inside a herdr pane, drive that pane's agent dot from the agent's status.
+    label = agent_label(target)
+    if HERDR_PANE and not os.environ.get("AGENTTY_NO_HERDR"):
+        threading.Thread(target=watch_status, args=(base, label, st), daemon=True).start()
+    else:
+        label = None
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    signal.signal(signal.SIGWINCH, lambda *_: setattr(st, "dirty", True))
+    mouse = not os.environ.get("AGENTTY_NO_MOUSE")
+    sys.stdout.write("\x1b[?1049h\x1b[?25l" + (MOUSE_ON if mouse else ""))
+    try:
+        tty.setraw(fd)
+        while True:
+            if st.dirty:
+                st.dirty = False
+                render(st)
+            if not select.select([fd], [], [], 0.1)[0]:
+                continue
+            data = os.read(fd, 1024)
+            if not data:
+                break
+            if QUIT in data:
+                break
+            data, notches = strip_mouse(data)
+            if notches:
+                scroll_by(st, notches * WHEEL_LINES)
+            if not data:
+                continue
+            action = SCROLL_KEYS.get(data)
+            if action:
+                _, rows = os.get_terminal_size()
+                page = max(1, rows - 3)
+                if action == "pgup":
+                    scroll_by(st, page)
+                elif action == "pgdn":
+                    scroll_by(st, -page)
+                elif action == "home":
+                    scroll_by(st, 0, absolute=10**9)
+                else:
+                    scroll_by(st, 0, absolute=0)
+                continue
+            scroll_by(st, 0, absolute=0)  # typing snaps back to live
+            with st.lock:
+                caret = input_cursor(st.lines) if st.caret_back is not None else None
+                if echo and caret:
+                    server_line = composer_text(st.lines[caret[0]])
+                    edited = apply_edit(
+                        st.pred[1] if st.pred else server_line, st.caret_back, data)
+                    if predictable(st.lines[caret[0]], edited,
+                                   st.width or len(edited or "")):
+                        st.pred = (st.pred[0] if st.pred else server_line,
+                                   edited, time.monotonic() + ECHO_GRACE)
+                    else:
+                        st.pred = None  # let the agent's own wrapping show
+                elif st.pred:
+                    st.pred = None
+                st.caret_back = track_caret(data, st.caret_back)
+                st.dirty = True
+            outbox.put(data)
+    finally:
+        st.stop = True
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write((MOUSE_OFF if mouse else "") + "\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        if label:
+            subprocess.run([HERDR_BIN, "pane", "release-agent", HERDR_PANE,
+                            "--source", "agentty", "--agent", label],
+                           capture_output=True)
+        if tunnel:
+            tunnel.terminate()
+
+
+if __name__ == "__main__":
+    main()

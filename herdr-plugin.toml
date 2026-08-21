@@ -1,0 +1,24 @@
+id = "ubuntudroid.coder-sessions"
+name = "Coder Agent Sessions"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Browse running Coder agent sessions and open each as its own workspace: agentty on top (two thirds) with a plain ssh shell below. Coder task workspaces have no tmux -- the agent runs under agentapi -- so agentty is what makes the session scrollable and typable."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "pick"
+title = "Coder sessions: pick and open"
+contexts = ["workspace", "tab", "pane"]
+# Action commands run without a terminal, so this only asks herdr to open the
+# `list` pane below; the picker itself needs a TTY for fzf.
+command = ["python3", "coder-sessions.py", "--pane"]
+
+[[panes]]
+id = "list"
+title = "Coder sessions"
+# The picker is transient and should not disturb the tiled layout; a popup is
+# session-modal and receives all input, including Escape.
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["python3", "coder-sessions.py"]
