@@ -13,6 +13,7 @@ PgUp/PgDn/Home/End scroll locally and are never sent to the agent.
 Every other key goes to the agent unchanged. Ctrl+] quits.
 """
 
+import http.client
 import json
 import os
 import queue
@@ -227,14 +228,12 @@ def read_screen(base, st):
             time.sleep(1)
 
 
-def send_keys(base, data):
-    req = urllib.request.Request(
-        base + "/message",
-        data=json.dumps({"type": "raw", "content": data.decode("utf-8", "replace")}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    urllib.request.urlopen(req, timeout=10).close()
+def send_keys(conn, data):
+    body = json.dumps({"type": "raw",
+                       "content": data.decode("utf-8", "replace")}).encode()
+    conn.request("POST", "/message", body=body,
+                 headers={"Content-Type": "application/json"})
+    conn.getresponse().read()
 
 
 # Caret tracking. The screen arrives as plain text with no cursor position, but
@@ -252,8 +251,9 @@ CARET_TO_END = (b"\r", b"\n", b"\x05", b"\x0b",  # Enter, Ctrl+E, Ctrl+K
 def apply_edit(text, back, data):
     """Apply one keystroke to the input line locally. None if we can't predict it.
 
-    The round trip to the agent is ~600ms on a remote workspace, so without this
-    a keystroke looks like it did nothing -- most visibly a lone backspace.
+    A keystroke takes ~630ms to come back on a remote workspace (~130ms of POST,
+    the rest the agent's own redraw), so without this a keystroke looks like it
+    did nothing -- most visibly a lone backspace.
     """
     at = len(text) - back
     floor = prompt_prefix(text)
@@ -301,6 +301,8 @@ def track_caret(data, back):
 
 RULE_RE = re.compile(r"^[─━┄┅-]{10,}$")
 MARKERS = "›>❯$#|"
+# Claude Code separates the marker from the text with U+00A0, not a space.
+SPACES = (" ", "\xa0")
 
 # The agent draws a hint in the empty composer ("Ask Codex to do anything").
 # It is not input, so it must not be echoed into, edited, or deleted first.
@@ -321,14 +323,14 @@ def prompt_prefix(line):
     survive, or typing into an empty composer loses it.
     """
     i = 0
-    while i < len(line) and line[i] == " ":
+    while i < len(line) and line[i] in SPACES:
         i += 1
     j = i
     while j < len(line) and line[j] in MARKERS:
         j += 1
     if j == i:
         return 0
-    return j + 1 if j < len(line) and line[j] == " " else j
+    return j + 1 if j < len(line) and line[j] in SPACES else j
 
 
 def composer_text(line):
@@ -350,32 +352,35 @@ def input_cursor(lines):
 
     ponytail: a heuristic, because the server sends plain screen text and no
     cursor position (ScreenUpdateBody is {"screen": string}, nothing else).
-    Codex and Claude Code both draw a horizontal rule above the composer and a
-    status line at the very bottom, so the caret sits after the last text
-    between the two. Any other layout gets no cursor, which is today's
-    behaviour anyway.
+    Codex draws one horizontal rule above the composer and a status line at the
+    very bottom; Claude Code brackets the composer with a rule above *and*
+    below. So the composer is the last text between a rule and whatever closes
+    it -- the next rule down, or the status line. Any other layout gets no
+    cursor, which is today's behaviour anyway.
     """
-    rule = None
-    for i in range(len(lines) - 1, -1, -1):
-        if RULE_RE.match(lines[i].strip()):
-            rule = i
-            break
-    if rule is None:
+    rules = [i for i, line in enumerate(lines) if RULE_RE.match(line.strip())]
+    if not rules:
         return None
-    footer = None
-    for i in range(len(lines) - 1, rule, -1):
+    tail = len(lines)
+    for i in range(len(lines) - 1, rules[-1], -1):
         if lines[i].strip():
-            footer = i
+            tail = i
             break
-    end = footer if footer is not None else len(lines)
-    row = None
-    for i in range(rule + 1, end):
-        if lines[i].strip():
-            row = i
+    # Only the bottom two rules can bracket a composer. Climbing further would
+    # hand the caret to a rule that is really transcript text.
+    row = empty = None
+    for k in range(len(rules) - 1, max(-1, len(rules) - 3), -1):
+        end = rules[k + 1] if k + 1 < len(rules) else tail
+        for i in range(rules[k] + 1, end):
+            if lines[i].strip():
+                row = i
+        if row is not None:
+            break
+        empty = (rules[k] + 1, end)
     if row is None:
-        row = rule + 1
-        if row >= end:
+        if empty is None or empty[0] >= empty[1]:
             return None
+        row = empty[0]  # an empty composer between the rules
     return row, max(len(lines[row].rstrip()), prompt_prefix(lines[row]))
 
 
@@ -436,6 +441,13 @@ def selftest():
     assert input_cursor(["just", "output", "no rule"]) is None
     # a rule inside the transcript must not win over the composer's rule
     assert input_cursor(["a", rule, "b", rule, "› hi", footer]) == (4, 4)
+    # Claude Code closes the composer with a second rule and pads the marker
+    # with U+00A0; the caret belongs on the composer, not on the rule below it.
+    cc = ["out", rule, "❯\xa0" + " " * 60, rule,
+          "  ⏵⏵ bypass permissions on · esc to interrupt"]
+    assert input_cursor(cc) == (2, 2), input_cursor(cc)
+    # three rules: the top one is transcript, so it never gets the caret
+    assert input_cursor(["a", rule, "b", rule, "❯\xa0", rule, footer]) == (4, 2)
 
     assert track_caret(b"x", 0) == 0            # typing at the end stays at the end
     assert track_caret(b"\x1b[D", 0) == 1       # Left
@@ -468,6 +480,9 @@ def selftest():
     assert prompt_prefix("› hi" + pad) == 2      # marker plus its one space
     assert prompt_prefix("›" + pad) == 2
     assert prompt_prefix("  no marker here") == 0
+    assert prompt_prefix("❯\xa0hi") == 2       # nbsp counts as the prompt's space
+    assert composer_text("❯\xa0" + " " * 60) == "❯\xa0"
+    assert apply_edit("❯\xa0", 0, b"h") == "❯\xa0h"
     assert composer_text("› " + pad) == "› "     # padding goes, prompt space stays
     assert composer_text("› hi" + pad) == "› hi"
     assert apply_edit(composer_text("› " + pad), 0, b"h") == "› h"
@@ -492,7 +507,14 @@ def selftest():
 
 
 def sender(base, outbox, st):
-    """Post keystrokes off the input thread -- the POST costs a full round trip."""
+    """Post keystrokes off the input thread -- the POST costs a full round trip.
+
+    One connection, kept alive: through an ssh -L tunnel a fresh connection has
+    to open a channel first, measured at 280ms per keystroke against 128ms on a
+    connection already up.
+    """
+    host, _, port = base.rpartition("//")[2].partition(":")
+    conn = None
     while True:
         data = outbox.get()
         if data is None:
@@ -508,12 +530,24 @@ def sender(base, outbox, st):
                 outbox.put(None)  # keep the sentinel for the next loop
                 break
             data += more
-        try:
-            send_keys(base, data)
-        except Exception as exc:
-            with st.lock:
-                st.error = f"send failed: {exc}"
-                st.dirty = True
+        for last_try in (False, True):
+            try:
+                if conn is None:
+                    conn = http.client.HTTPConnection(host, int(port), timeout=10)
+                send_keys(conn, data)
+                break
+            except Exception as exc:
+                if conn is not None:
+                    conn.close()
+                    conn = None
+                # A timeout may already have been served, and replaying it would
+                # type the burst twice; a dropped keep-alive served nothing, so
+                # that one is worth one more go on a fresh connection.
+                if last_try or isinstance(exc, TimeoutError):
+                    with st.lock:
+                        st.error = f"send failed: {exc}"
+                        st.dirty = True
+                    break
 
 
 def render(st):
