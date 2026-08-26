@@ -10,6 +10,7 @@ primitives -- SSE GET /internal/screen for the screen, POST /message
     agentty localhost:3284         # already-forwarded port
 
 PgUp/PgDn/Home/End scroll locally and are never sent to the agent.
+Shift+Enter reaches the agent as ESC+CR, the newline it understands.
 Every other key goes to the agent unchanged. Ctrl+] quits.
 """
 
@@ -38,6 +39,12 @@ SCROLL_KEYS = {
     b"\x1bOF": "end",
 }
 QUIT = b"\x1d"  # Ctrl+]
+
+# Legacy encoding has no form for Shift+Enter, so herdr sends it as xterm
+# modifyOtherKeys, a mode this client never asked for and the agent ignores.
+# ESC+CR is what the agent reads as a newline, and what Option+Enter already
+# sends, so rewrite to that rather than teaching the agent a new sequence.
+REWRITE = {b"\x1b[27;2;13~": b"\x1b\r"}  # Shift+Enter
 
 # SGR mouse reporting: ESC [ < button ; col ; row M|m
 MOUSE_RE = re.compile(rb"\x1b\[<(\d+);\d+;\d+[Mm]")
@@ -438,6 +445,11 @@ def selftest():
     assert strip_mouse(b"hi\x1b[<64;1;1Mthere") == (b"hithere", 1)  # mixed read
     assert strip_mouse(b"\x1b[5~") == (b"\x1b[5~", 0)           # PgUp untouched
 
+    # Shift+Enter must land as a newline: not submit (track_caret would zero),
+    # not a local scroll key.
+    assert REWRITE[b"\x1b[27;2;13~"] == b"\x1b\r"
+    assert b"\x1b\r" not in SCROLL_KEYS and track_caret(b"\x1b\r", 3) is None
+
     rule = "─" * 40
     footer = "  some-model high · ~/example-repo · Main"
     assert input_cursor(["out", rule, "› update the branch", "", footer]) == (2, 19)
@@ -659,6 +671,7 @@ def main():
                 scroll_by(st, notches * WHEEL_LINES)
             if not data:
                 continue
+            data = REWRITE.get(data, data)
             action = SCROLL_KEYS.get(data)
             if action:
                 _, rows = os.get_terminal_size()

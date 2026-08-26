@@ -244,6 +244,8 @@ each frame with no viewport, so nothing scrolls.
 It adds PgUp/PgDn/Home/End and mouse-wheel scrolling, a caret at the composer,
 local echo (the round trip to a remote workspace is ~600 ms), suppression of the
 agent's empty-composer hint, and folding for panes narrower than the agent.
+Shift+Enter inserts a newline: herdr sends it as xterm modifyOtherKeys, which
+the agent ignores, so it is rewritten to the ESC+CR the agent reads as one.
 `Ctrl+]` quits; `agentty --selftest` checks the pure helpers. Inside a herdr pane
 it also reports the remote agent's state, so the session gets a real agent dot.
 
