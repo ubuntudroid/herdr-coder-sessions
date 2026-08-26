@@ -361,7 +361,7 @@ def mirror_session(name, conf, focus=False):
     """Reproduce the session's checkout locally and return its herdr workspace.
 
     Returns (workspace_id, checkout_path, made_the_worktree), or (None, None, False)
-    when the session's repo has no local clone -- the caller then falls back to a
+    when the session cannot be mirrored -- the caller then falls back to a
     plain workspace. The last flag says which herdr event the open fired, which is
     what decides whether reviewr auto-opened (see open_reviewr).
 
@@ -426,8 +426,15 @@ def mirror_session(name, conf, focus=False):
     made = not checkout
     if checkout:
         if not is_mirror(checkout):
-            sys.exit(f"{checkout} is a worktree for {branch} but not a mirror "
-                     f"(no {MIRROR_MARK} marker); refusing to reset work that is not mine")
+            # Nearly always the clone's own checkout: a session that has not
+            # branched yet sits on main, and so does the clone. Resetting either
+            # that or a worktree of your own would throw away work the plugin
+            # never made, so mirror nothing rather than refuse the session.
+            note(f"{branch} is checked out at {checkout}, which is not a mirror "
+                 f"(no {MIRROR_MARK} marker) -- opening {name} without one; to "
+                 f"retry, close its workspace and pick the session again once it "
+                 f"is on a branch of its own")
+            return None, None, False
         run(["git", "-C", checkout, "reset", "-q", "--hard", base])
         run(["git", "-C", checkout, "clean", "-qfd"])
         claim_branch(clone, branch, base)
