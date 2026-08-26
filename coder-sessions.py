@@ -984,6 +984,9 @@ if __name__ == "__main__":
     except SystemExit as exc:  # sys.exit("message") -- our own error path
         if exc.code not in (None, 0):
             hold(str(exc.code))
+            # Not a bare `raise`: re-raising a string code makes the interpreter
+            # print the same sentence a second time, under the one just held.
+            raise SystemExit(1)
         raise
     except KeyboardInterrupt:
         raise SystemExit(130)
