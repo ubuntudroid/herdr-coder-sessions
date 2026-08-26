@@ -7,8 +7,18 @@ Coder task workspaces have no tmux or screen: the agent runs under
 [agentapi](https://github.com/coder/agentapi), which owns the PTY and exposes it
 over HTTP on port 3284. `agentapi attach` renders that screen but has no
 viewport, so nothing scrolls. This plugin builds a workspace per session around
-[`agentty`](#requirements), which adds scrolling, mouse wheel, a caret, and
+[`agentty`](#agentty), which adds scrolling, mouse wheel, a caret, and
 local echo over the same endpoints.
+
+## Install
+
+```sh
+herdr plugin install ubuntudroid/herdr-coder-sessions
+```
+
+Nothing to build: two Python files, standard library only. See
+[Requirements](#requirements) for what has to be on the machine, and
+[Configuration](#configuration) for the one setting most people need to change.
 
 ## Layout
 
@@ -22,8 +32,9 @@ Each session gets one workspace, labelled with the session name:
 └───────────────────────────┴───────────────────┘
 ```
 
-reviewr opens itself (herdr's `worktree.created` event); the plugin never mentions it. Need a
-shell on the box? `ssh <session>.coder` in any pane.
+The review pane is [reviewr](https://github.com/persiyanov/herdr-reviewr), and it is optional —
+without it you get the agent pane alone. Need a shell on the box? `ssh <session>.coder` in any
+pane.
 
 Picking a session that is already open focuses its workspace instead of building
 a second one; those rows are marked `●` in the list.
@@ -42,7 +53,7 @@ Bind the action in `~/.config/herdr/config.toml`:
 key = "prefix+shift+c"
 type = "plugin_action"
 command = "ubuntudroid.coder-sessions.pick"
-description = "Coder agent sessions (agentty + ssh)"
+description = "Coder agent sessions"
 ```
 
 Or, without installing the plugin, point a popup straight at the script:
@@ -52,7 +63,7 @@ Or, without installing the plugin, point a popup straight at the script:
 key = "prefix+shift+c"
 type = "popup"
 command = "python3 /path/to/herdr-coder-sessions/coder-sessions.py"
-description = "Coder agent sessions (agentty + ssh)"
+description = "Coder agent sessions"
 width = "90%"
 height = "80%"
 ```
@@ -105,8 +116,14 @@ plugin reproduces the session locally and reviews that. On open it:
 5. applies the session's uncommitted work: `git diff HEAD` for tracked files, plus a tar of
    `git ls-files -o --exclude-standard` for untracked ones.
 
-`reviewr` auto-opens in that workspace on herdr's `worktree.created` event, so the review pane
-needs no wiring — you end up with agentty over ssh on the left and reviewr on the right.
+You end up with agentty over ssh on the left and [reviewr](https://github.com/persiyanov/herdr-reviewr)
+on the right, with no wiring. A brand-new mirror gets reviewr from reviewr's own
+`worktree.created` subscription; every open after that reuses the checkout, which fires
+`worktree.opened` instead — an event reviewr does not watch
+([#82](https://github.com/persiyanov/herdr-reviewr/issues/82)) — so on exactly those openings the
+plugin asks for the pane itself, honouring reviewr's own placement and `auto_open` settings. If
+reviewr is not installed, or you turned its auto-open off, nothing is opened and the mirror is
+still there for whatever tool you prefer.
 
 ### When it refreshes
 
@@ -134,11 +151,51 @@ own `git status`.
 
 ## Requirements
 
-- `coder` CLI, logged in. Sessions come from `coder task list`.
-- `fzf` for the picker. `--list` and `--open` work without it.
-- An ssh host per session. Coder's generated ssh config gives `<name>.coder`;
-  change `host_suffix` if yours differs.
-- Python 3.9+, standard library only. No build step, nothing to compile.
+Needed:
+
+- **herdr 0.8.0+** on **macOS or Linux**. It uses popup plugin panes, workspace
+  metadata tokens and the worktree CLI; there is no Windows support, because
+  `agentty` drives a Unix terminal directly.
+- **Python 3.9+**, standard library only. No build step, nothing to compile.
+  Whatever `python3` resolves to on your `PATH` is what runs.
+- **`coder` CLI, logged in, new enough to have `coder task`.** The list is
+  `coder task list -o json`.
+- **ssh access to each session**, as `<session-name><host_suffix>`. Coder's
+  generated ssh config gives `<name>.coder`; set `host_suffix` if yours differs.
+
+Optional, each with a working fallback:
+
+- **`fzf`** for the picker. Without it, `--list` and `--open <name>` still work.
+- **A local clone of the session's repo**, at `clone_root/<owner>/<repo>`. This
+  is what mirroring needs; without a match the session opens as a plain
+  workspace. `clone_root` defaults to `~/projects/github` — the setting most
+  people have to change.
+- **[reviewr](https://github.com/persiyanov/herdr-reviewr)** for the review pane.
+  Not installed means the agent pane alone; the mirror worktree is a normal
+  worktree, so any review tool can be pointed at it.
+
+### The ideal setup
+
+herdr 0.8.2 on macOS with `fzf` and reviewr installed, `coder` logged in with
+its ssh config generated, and every repo you review cloned under one root as
+`<owner>/<repo>` (the same layout gh-dash's `repoPaths` uses).
+
+### When something is missing
+
+Nothing here fails with a traceback; each degrades to the next-best thing:
+
+| missing | what happens |
+| --- | --- |
+| `coder`, `git`, `ssh` | one line naming the binary, then it stops |
+| an old `coder` without `task` | one line saying so, with the CLI's own answer |
+| `fzf` | the picker refuses and points at `--list` / `--open` |
+| ssh to the session | the session opens without a mirror |
+| no local clone | the session opens without a mirror, naming the path it looked under and the config file to change |
+| a shallow session clone | the mirror comes from `origin` instead, with the agent's commits folded into one diff |
+| reviewr | the agent pane opens alone |
+| Python below 3.9 | one line naming the interpreter and its version |
+| an unwritable state dir | previews go empty; the picker still works |
+| an `agentty` that lost its executable bit | it runs through the interpreter instead |
 
 ## agentty
 
@@ -181,3 +238,7 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
   session; `agentty` folds rather than truncates it.
 - `coder task list` takes roughly 700ms, too slow for an fzf preview per
   keystroke, so the list writes a cache that the preview reads.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

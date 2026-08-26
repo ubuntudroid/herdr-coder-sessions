@@ -76,10 +76,26 @@ def settings():
     return merged
 
 
+def config_hint():
+    """Where to change the settings, named so a message about them is actionable."""
+    path = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if path:
+        return os.path.join(path, "config.json")
+    return f"config.json under `herdr plugin config-dir {PLUGIN_ID}`"
+
+
 def run(argv, check=True):
     """Run a command, returning stdout. stderr is dropped: the coder CLI prints
-    a version-mismatch warning there on every call."""
-    proc = subprocess.run(argv, capture_output=True, text=True)
+    a version-mismatch warning there on every call.
+
+    A missing binary is fatal whatever `check` says -- there is no partial answer
+    from a tool that is not installed -- so it exits with a sentence rather than
+    the traceback the caller would otherwise get.
+    """
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit(f"{argv[0]} is not installed, or not on this PATH")
     if check and proc.returncode != 0:
         sys.exit(f"{argv[0]} failed: {(proc.stderr or proc.stdout).strip()[:300]}")
     return proc.stdout
@@ -101,9 +117,13 @@ def agentty_cmd():
     The pane must run the copy this plugin was installed with -- a PATH lookup
     would silently pick up a different version, or nothing at all.
     """
-    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentty")
+    local = os.path.join(os.path.dirname(SELF), "agentty")
     if os.access(local, os.X_OK):
         return shlex.quote(local)
+    if os.path.isfile(local):
+        # A copy that lost its executable bit -- a zip download, a restrictive
+        # umask -- still runs perfectly well through the interpreter.
+        return f"{shlex.quote(sys.executable)} {shlex.quote(local)}"
     if shutil.which("agentty"):
         return "agentty"
     sys.exit("agentty not found: expected it beside this script or on PATH")
@@ -115,7 +135,11 @@ def running_sessions(running_only=True):
     ticket is still the best label."""
     out = run(["coder", "task", "list", "-o", "json"])
     start = out.find("[")
-    tasks = json.loads(out[start:]) if start >= 0 else []
+    try:
+        tasks = json.loads(out[start:]) if start >= 0 else []
+    except ValueError:
+        sys.exit("could not read `coder task list -o json` -- this needs a coder "
+                 f"CLI with task support. It answered: {out.strip()[:200]}")
     if not running_only:
         return tasks
     return [t for t in tasks if t.get("workspace_status") == "running"]
@@ -359,7 +383,8 @@ def mirror_session(name, conf, focus=False):
     clone = clone_path(slug, conf["clone_root"])
     if not clone:
         note(f"no local clone for {slug or 'the session repo'} under "
-             f"{conf['clone_root']} -- skipping the mirror")
+             f"{conf['clone_root']} -- opening without a mirror "
+             f"(point clone_root at your clones in {config_hint()})")
         return None, None, False
     fetch_review_base(clone)  # before the base: a fresher origin also widens `connected`
 
@@ -595,8 +620,12 @@ def preview(session):
 
 
 def cache_write(sessions):
-    with open(CACHE, "w") as handle:
-        json.dump(sessions, handle)
+    try:
+        with open(CACHE, "w") as handle:
+            json.dump(sessions, handle)
+    except OSError as exc:
+        # Only the fzf preview reads this; losing it must not cost you the picker.
+        note(f"could not write the preview cache ({exc}) -- previews will be empty")
 
 
 def cache_read():
@@ -848,6 +877,12 @@ def selftest():
 
 
 def main():
+    if sys.version_info < (3, 9):
+        # Said here rather than left to bite later: the first failure would
+        # otherwise be an AttributeError from the middle of a mirror.
+        sys.exit(f"this needs Python 3.9 or newer; {sys.executable} is "
+                 f"{'.'.join(str(n) for n in sys.version_info[:3])}")
+
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("--selftest", action="store_true", help="check the pure helpers")
     parser.add_argument("--refresh", action="store_true",

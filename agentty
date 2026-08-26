@@ -85,11 +85,15 @@ def free_port():
 def open_tunnel(host, remote_port):
     """ssh -N -L <local>:127.0.0.1:<remote_port> host. Returns (proc, local_port)."""
     local = free_port()
-    proc = subprocess.Popen(
-        ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
-         "-L", f"{local}:127.0.0.1:{remote_port}", host],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-    )
+    try:
+        proc = subprocess.Popen(
+            ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+             "-L", f"{local}:127.0.0.1:{remote_port}", host],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        sys.exit("ssh is not installed, or not on this PATH; pass an "
+                 "already-forwarded host:port instead")
     for _ in range(100):  # wait up to 10s for the forward to come up
         if proc.poll() is not None:
             err = proc.stderr.read().decode(errors="replace").strip()
@@ -604,6 +608,10 @@ def main():
         sys.exit(__doc__)
     if sys.argv[1] == "--selftest":
         return selftest()
+    if not sys.stdin.isatty():
+        # It drives a terminal directly: raw mode, an alt screen, cursor keys.
+        # Without one, termios would raise from the middle of the setup instead.
+        sys.exit("agentty needs a terminal; run it in a pane, not through a pipe")
     target = sys.argv[1]
     remote_port = int(sys.argv[2]) if len(sys.argv) > 2 else 3284
 
