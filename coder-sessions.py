@@ -302,6 +302,37 @@ def shared_base(host, repo, clone):
     return None, 0
 
 
+def fetch_review_base(clone):
+    """Refresh what reviewr diffs against, so its merge-base is not stale.
+
+    reviewr's branch scope diffs from `merge-base(base, HEAD)` and resolves that base
+    as: its `--base` flag, then the repository's pick, then the branch `origin/HEAD`
+    names (reviewr's `git.rs::resolve_base`). No flag reaches a plugin pane, so the
+    pick or `origin/HEAD` it is. Either way the winner is a remote-tracking ref, and a
+    clone whose copy predates what the session branched from drags every commit merged
+    upstream since into the diff -- files the branch never touched.
+
+    One branch and never a whole `fetch origin`, because this runs on every finished
+    agent turn; silent on failure, because offline must not stop a mirror.
+    """
+    pick = run(["git", "-C", clone, "cat-file", "blob", "refs/reviewr/base-pick"],
+               check=False).strip()
+    if pick:
+        # reviewr resolves a pick that is not a branch name -- a SHA, `HEAD~2` -- inside
+        # the clone, where no fetch can help. Its own guard, so the same picks qualify.
+        if pick.startswith("-") or ".." in pick or "@{" in pick or \
+                any(c in pick for c in "~^:?*[\\") or len(pick.split()) != 1:
+            return None
+        branch = pick
+    else:
+        branch = run(["git", "-C", clone, "rev-parse", "--abbrev-ref", "origin/HEAD"],
+                     check=False).strip().split("/", 1)[-1] or "main"
+    ok = subprocess.run(["git", "-C", clone, "fetch", "-q", "--no-tags", "origin",
+                         f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                        capture_output=True).returncode == 0
+    return branch if ok else None
+
+
 def mirror_session(name, conf, focus=False):
     """Reproduce the session's checkout locally and return its herdr workspace.
 
@@ -330,6 +361,7 @@ def mirror_session(name, conf, focus=False):
         note(f"no local clone for {slug or 'the session repo'} under "
              f"{conf['clone_root']} -- skipping the mirror")
         return None, None, False
+    fetch_review_base(clone)  # before the base: a fresher origin also widens `connected`
 
     # A named local branch, not a detached ref: reviewr's PR tab resolves the PR
     # from the current branch name, the same answer `gh pr view` gives. Forced,
