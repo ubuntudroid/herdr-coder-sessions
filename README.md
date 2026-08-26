@@ -109,11 +109,15 @@ plugin reproduces the session locally and reviews that. On open it:
 1. asks the session for its repo root, branch and `origin` URL over ssh;
 2. finds the matching local clone (`clone_root/<owner>/<repo>`, the same mapping gh-dash's
    `repoPaths` uses) — if there is none, it falls back to a plain workspace and skips the rest;
-3. fetches `+HEAD:<branch>` **straight from the workspace over ssh**, so commits the agent has
+3. refreshes the one branch reviewr will diff against — the repository's base pick if you set
+   one, otherwise whatever `origin/HEAD` names — because a clone whose copy of that branch
+   predates what the session branched from puts every commit merged upstream since inside the
+   diff, as files the branch never touched;
+4. fetches `+HEAD:<branch>` **straight from the workspace over ssh**, so commits the agent has
    not pushed are included, onto a local branch with the session's own name;
-4. creates a herdr worktree from that clone, which makes the workspace worktree-backed (herdr
+5. creates a herdr worktree from that clone, which makes the workspace worktree-backed (herdr
    then shows the branch under the name in the sidebar);
-5. applies the session's uncommitted work: `git diff HEAD` for tracked files, plus a tar of
+6. applies the session's uncommitted work: `git diff HEAD` for tracked files, plus a tar of
    `git ls-files -o --exclude-standard` for untracked ones.
 
 You end up with agentty over ssh on the left and [reviewr](https://github.com/persiyanov/herdr-reviewr)
@@ -170,15 +174,20 @@ Optional, each with a working fallback:
   is what mirroring needs; without a match the session opens as a plain
   workspace. `clone_root` defaults to `~/projects/github` — the setting most
   people have to change.
-- **[reviewr](https://github.com/persiyanov/herdr-reviewr)** for the review pane.
-  Not installed means the agent pane alone; the mirror worktree is a normal
-  worktree, so any review tool can be pointed at it.
+- **[reviewr](https://github.com/persiyanov/herdr-reviewr) 0.30.0+** for the
+  review pane. Not installed means the agent pane alone; the mirror worktree is a
+  normal worktree, so any review tool can be pointed at it. The version matters
+  only for step 3 above: 0.30.0 is where reviewr's base became the `--base` flag,
+  then a per-repository pick, then `origin/HEAD`, and where the `base_branches`
+  config key was removed. Older reviewrs have no pick ref, so the refresh always
+  lands on `origin/HEAD` while reviewr may still resolve a `base_branches` entry
+  nothing fetched.
 
 ### The ideal setup
 
-herdr 0.8.2 on macOS with `fzf` and reviewr installed, `coder` logged in with
-its ssh config generated, and every repo you review cloned under one root as
-`<owner>/<repo>` (the same layout gh-dash's `repoPaths` uses).
+herdr 0.8.2 on macOS with `fzf` and reviewr 0.34.0 installed, `coder` logged
+in with its ssh config generated, and every repo you review cloned under one
+root as `<owner>/<repo>` (the same layout gh-dash's `repoPaths` uses).
 
 ### When something is missing
 
@@ -193,6 +202,7 @@ Nothing here fails with a traceback; each degrades to the next-best thing:
 | no local clone | the session opens without a mirror, naming the path it looked under and the config file to change |
 | a shallow session clone | the mirror comes from `origin` instead, with the agent's commits folded into one diff |
 | reviewr | the agent pane opens alone |
+| reviewr below 0.30.0 | the base refresh can only guess `origin/HEAD`, so a `base_branches` base stays stale |
 | Python below 3.9 | one line naming the interpreter and its version |
 | an unwritable state dir | previews go empty; the picker still works |
 | an `agentty` that lost its executable bit | it runs through the interpreter instead |
