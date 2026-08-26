@@ -30,3 +30,12 @@ id = "refresh"
 title = "Coder sessions: refresh this mirror"
 contexts = ["workspace", "tab", "pane"]
 command = ["python3", "coder-sessions.py", "--refresh"]
+
+# The offer to move a session into a mirror, once the agent has branched. A split
+# beside the agent, not the popup the picker uses: this opens while the agent is
+# mid-task, and a session-modal popup would swallow what is being typed at it.
+[[panes]]
+id = "promote"
+title = "Coder sessions: mirror this session?"
+placement = "split"
+command = ["python3", "coder-sessions.py", "--promote"]

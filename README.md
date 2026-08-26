@@ -54,7 +54,16 @@ key = "prefix+shift+c"
 type = "plugin_action"
 command = "ubuntudroid.coder-sessions.pick"
 description = "Coder agent sessions"
+
+[[keys.command]]
+key = "prefix+ctrl+m"
+type = "plugin_action"
+command = "ubuntudroid.coder-sessions.refresh"
+description = "refresh this Coder mirror"
 ```
+
+The second key refreshes the focused session's mirror, and in a workspace that has
+none yet it moves the session into one — see [Mirroring](#mirroring).
 
 Or, without installing the plugin, point a popup straight at the script:
 
@@ -137,8 +146,9 @@ still there for whatever tool you prefer.
   the refresh lands exactly when new work exists and nothing is mid-write. `AGENTTY_ON_IDLE` is
   generic — agentty knows nothing about this plugin.
 - **On demand**, with `prefix+ctrl+m` (the `refresh` action), which refreshes the focused
-  workspace's mirror. It reads the session name from the `coder` metadata token, so it needs no
-  argument, and refuses cleanly in a workspace that is not a session's.
+  workspace's mirror — or, in a workspace that has none yet, moves the session into one. It
+  reads the session name from the `coder` metadata token, so it needs no argument, and refuses
+  cleanly in a workspace that is not a session's.
 - **On first open**, as part of building the workspace.
 
 Re-picking an already-open session only focuses it; it does not refresh.
@@ -147,6 +157,22 @@ The mirror is **derived, never authored in**: `--mirror <name>` refreshes it by 
 to the session's current state. A marker in the worktree's git dir (not the working tree, so it
 never shows in `git status`) records that the worktree is a mirror; without it the refresh
 refuses, so a worktree you made yourself is never reset.
+
+### When the session is still on your branch
+
+A session that has not branched yet sits on `main`, and so does your clone: the only worktree
+on that branch is your own checkout, which the plugin will not reset. The session opens with
+the agent pane alone.
+
+The idle hook stays on, and watches the branch instead of the mirror. The turn the agent
+branches, a pane splits in below the agent and asks whether to move the session into a mirror.
+`y` builds the worktree workspace, opens reviewr, and closes the agent's old pane — herdr
+collapses whatever that empties, so a session that had a workspace to itself takes it along,
+and one parked in a tab of yours loses only that tab. The single pane it will not close is the
+last one in a workspace this plugin did not open, because that would close your workspace too;
+agentty is left running there instead, and says so. `n` closes the offer, and nothing asks
+again until the branch changes.
+`prefix+ctrl+m` makes the same move whenever you want it.
 
 Two deliberate choices: the source refspec is `HEAD`, not the branch name, because a workspace
 can hold several session branches and `HEAD` is unambiguous; and `git add -N` is *not* used to
@@ -200,11 +226,12 @@ Nothing here fails with a traceback; each degrades to the next-best thing:
 | `fzf` | the picker refuses and points at `--list` / `--open` |
 | ssh to the session | the session opens without a mirror |
 | no local clone | the session opens without a mirror, naming the path it looked under and the config file to change |
+| a session still on the branch your clone has checked out | the session opens without a mirror, and is offered one the turn the agent branches |
 | a shallow session clone | the mirror comes from `origin` instead, with the agent's commits folded into one diff |
 | reviewr | the agent pane opens alone |
 | reviewr below 0.30.0 | the base refresh can only guess `origin/HEAD`, so a `base_branches` base stays stale |
 | Python below 3.9 | one line naming the interpreter and its version |
-| an unwritable state dir | previews go empty; the picker still works |
+| an unwritable state dir | previews go empty and the mirror offer repeats each turn; the picker still works |
 | an `agentty` that lost its executable bit | it runs through the interpreter instead |
 
 ## agentty

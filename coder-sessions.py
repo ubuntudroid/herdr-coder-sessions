@@ -10,8 +10,10 @@ that is already open focuses its workspace instead of building a second one.
     coder-sessions.py --list           print the rows, no picker
     coder-sessions.py --open NAME      open or focus one session's workspace
     coder-sessions.py --show NAME      preview text for one session
-    coder-sessions.py --mirror NAME    refresh one session's local mirror worktree
+    coder-sessions.py --mirror NAME    what a finished agent turn triggers: refresh
+                                       the mirror, or offer one once it is possible
     coder-sessions.py --refresh        same, for the focused workspace (plugin action)
+    coder-sessions.py --promote        the pane that asks before moving a session
     coder-sessions.py --relabel        re-apply the label scheme to open workspaces
     coder-sessions.py --selftest       check the naming helpers
 
@@ -431,9 +433,9 @@ def mirror_session(name, conf, focus=False):
             # that or a worktree of your own would throw away work the plugin
             # never made, so mirror nothing rather than refuse the session.
             note(f"{branch} is checked out at {checkout}, which is not a mirror "
-                 f"(no {MIRROR_MARK} marker) -- opening {name} without one; to "
-                 f"retry, close its workspace and pick the session again once it "
-                 f"is on a branch of its own")
+                 f"(no {MIRROR_MARK} marker) -- {name} gets no mirror while it is "
+                 f"on that branch; the turn the agent branches it is offered one, "
+                 f"and prefix+ctrl+m moves it there")
             return None, None, False
         run(["git", "-C", checkout, "reset", "-q", "--hard", base])
         run(["git", "-C", checkout, "clean", "-qfd"])
@@ -566,6 +568,60 @@ def open_workspaces():
         if name:
             found.setdefault(name, w["workspace_id"])
     return found
+
+
+def workspace_info(workspace):
+    """That workspace's entry in herdr's list, or {} once it is gone."""
+    return next((w for w in herdr("workspace", "list").get("result", {}).get("workspaces", [])
+                 if w["workspace_id"] == workspace), {})
+
+
+def pane_workspace(pane):
+    """The workspace a pane sits in."""
+    return herdr("pane", "get", pane).get("result", {}).get("pane", {}).get("workspace_id", "")
+
+
+def session_pane(workspace):
+    """The pane running agentty in this workspace -- where the session is."""
+    for pane in herdr("pane", "list", "--workspace", workspace)["result"]["panes"]:
+        if pane_running(pane["pane_id"], "agentty"):
+            return pane["pane_id"]
+    return None
+
+
+def plugin_workspace(workspace, name):
+    """Is this the workspace this plugin opened for `name`?
+
+    Read off that workspace, never looked up by name: while a session is being
+    moved, two workspaces answer to it, and only one of them is the one being
+    left. The label is the fallback open_workspaces() uses too, for after a herdr
+    restart has dropped the display-only token.
+    """
+    info = workspace_info(workspace)
+    label = info.get("label", "")
+    return ((info.get("tokens") or {}).get(TOKEN) == name
+            or (label.split()[-1] if label else "") == name)
+
+
+def last_pane(workspace, pane):
+    """Would closing `pane` empty this workspace, and so close the workspace too?
+
+    Our own pane does not count: the offer runs in a split beside the agent and
+    exits the moment the answer is acted on.
+    """
+    ours = os.environ.get("HERDR_PANE_ID", "")
+    return not [p for p in herdr("pane", "list", "--workspace", workspace)["result"]["panes"]
+                if p["pane_id"] not in (pane, ours)]
+
+
+def mirror_workspace(workspace):
+    """Is this workspace open on a mirror of ours?
+
+    The workspace being a worktree one is not enough: a session parked in a
+    worktree workspace of yours would look mirrored and never be offered one.
+    """
+    checkout = (workspace_info(workspace).get("worktree") or {}).get("checkout_path", "")
+    return bool(checkout) and is_mirror(checkout)
 
 
 def age(stamp):
@@ -728,8 +784,18 @@ def open_session(name, sessions=None):
     session = next(s for s in sessions if s["name"] == name)
 
     workspace = checkout = None
+    made = False
     if conf.get("mirror", True):
         workspace, checkout, made = mirror_session(name, conf)
+    attach_session(name, session, conf, workspace, checkout, made)
+
+
+def attach_session(name, session, conf, workspace, checkout, made):
+    """Give the session a workspace: label, token, agentty, reviewr, focus.
+
+    Shared by the first open and by promote(), which is this same setup run again
+    once a mirror the first open could not build has become possible.
+    """
     # Labelled after the mirror, not before: the checkout is where the session's
     # branch, and so its ticket, can be read.
     label = workspace_label(session, checkout_branch(checkout))
@@ -751,10 +817,10 @@ def open_session(name, sessions=None):
 
     host = f"{name}{conf['host_suffix']}"
     # Refresh the mirror whenever the agent finishes a turn: agentty already knows
-    # the exact running -> stable moment, so nothing has to poll.
-    hook = ""
-    if checkout:
-        hook = (f"AGENTTY_ON_IDLE={shlex.quote(f'{SELF} --mirror {name}')} ")
+    # the exact running -> stable moment, so nothing has to poll. A workspace with
+    # no mirror gets the hook too -- there it is what notices the agent branching,
+    # which is the moment a mirror becomes possible at all.
+    hook = f"AGENTTY_ON_IDLE={shlex.quote(f'{SELF} --mirror {name}')} "
     # `herdr pane run` sends text plus Enter, so aiming it at a pane that already
     # holds agentty types the command line into the *agent's* composer and sends it
     # to the remote agent as a prompt.
@@ -769,6 +835,122 @@ def open_session(name, sessions=None):
     if checkout and not made:
         open_reviewr(workspace, top, checkout)  # a fresh worktree gets reviewr's own event
     herdr("workspace", "focus", workspace)
+    return workspace
+
+
+def session_named(name):
+    """The session's description, for the label: the picker's cache, else the CLI."""
+    for session in cache_read():
+        if session["name"] == name:
+            return session
+    found = [s for s in (describe(t) for t in running_sessions(False)) if s["name"] == name]
+    return found[0] if found else {"name": name}
+
+
+def promote(name, pane):
+    """Move a session out of a mirrorless workspace and into a mirrored one.
+
+    What the first open could not do, because the session was still on the branch
+    the clone itself has checked out. Closing `pane` -- where agentty runs now --
+    is what moves the session, and herdr collapses whatever that empties: a tab of
+    its own, or the whole workspace once that was its last tab. Collapsing is right
+    for the workspace this plugin built for the session and wrong for one of yours
+    the session is parked in, so the pane stays put when it is the last one there.
+    """
+    conf = settings()
+    old = pane_workspace(pane)
+    ours = plugin_workspace(old, name)
+    workspace, checkout, made = mirror_session(name, conf)
+    if not workspace:
+        return None  # mirror_session has already said why
+    attach_session(name, session_named(name), conf, workspace, checkout, made)
+    if old and old != workspace:
+        # The token is what open_workspaces() matches on: left behind, the picker
+        # would go on focusing the workspace the session has just left.
+        herdr("workspace", "report-metadata", old, "--source", METADATA_SOURCE,
+              "--clear-token", TOKEN)
+    if ours or not last_pane(old, pane):
+        herdr("pane", "close", pane)  # last: this can take the tab we run in with it
+    else:
+        note(f"left agentty in {pane}: it is the last pane of {old}, which this "
+             f"plugin did not open, and closing it would close that workspace too")
+    return workspace
+
+
+def asked_before(name, branch):
+    """Has this branch already been offered for this session? Records as it asks.
+
+    An offer the agent's next turn repeats is nagging, and prefix+ctrl+m is there
+    for anyone who said no and then changed their mind.
+    """
+    path = os.path.join(STATE, f"asked-{name}")
+    try:
+        with open(path) as handle:
+            if handle.read().strip() == branch:
+                return True
+    except OSError:
+        pass
+    try:
+        with open(path, "w") as handle:
+            handle.write(branch)
+    except OSError:
+        pass  # an unwritable state dir means asking twice, never failing
+    return False
+
+
+def turn_finished(name):
+    """The idle hook: refresh the mirror, or offer one that has become possible.
+
+    A workspace with no mirror is one opened while the session sat on the branch
+    the clone has checked out -- usually main, before the agent branched. Nothing
+    could be mirrored then, so here the hook watches the branch instead and offers
+    once it changes: in a split beside the agent, unfocused, because this fires
+    mid-work and must not swallow what is being typed at the session.
+    """
+    conf = settings()
+    pane = os.environ.get("HERDR_PANE_ID", "")  # agentty's pane; the hook is its child
+    workspace = pane_workspace(pane) if pane else ""
+    if not workspace or mirror_workspace(workspace):
+        return mirror_session(name, conf)
+
+    _, branch, slug, _ = remote_repo(f"{name}{conf['host_suffix']}")
+    clone = clone_path(slug, conf["clone_root"])
+    if not branch or not clone:
+        return None
+    taken = worktree_for(clone, branch)
+    if taken and not is_mirror(taken):
+        return None  # still a checkout of yours; there is nothing to offer yet
+    if asked_before(name, branch):
+        return None
+    return herdr("plugin", "pane", "open",
+                 "--plugin", os.environ.get("HERDR_PLUGIN_ID", PLUGIN_ID),
+                 "--entrypoint", "promote", "--placement", "split",
+                 "--target-pane", pane, "--direction", "down", "--no-focus",
+                 "--env", f"CODER_SESSION={name}", "--env", f"CODER_PANE={pane}",
+                 "--env", f"CODER_BRANCH={branch}")
+
+
+def promote_pane():
+    """The offer itself, in a pane of its own: ask, then move the session.
+
+    A plugin pane closes the moment its command exits, so a refusal needs no
+    goodbye -- but anything that failed has to wait on a keypress to be read.
+    """
+    name = os.environ.get("CODER_SESSION", "")
+    pane = os.environ.get("CODER_PANE", "")
+    branch = os.environ.get("CODER_BRANCH", "a branch of its own")
+    if not name or not pane:
+        sys.exit("nothing to promote (CODER_SESSION/CODER_PANE unset)")
+    print(f"{name} is on {branch} now, so it can be mirrored: a worktree workspace "
+          f"with the review pane, and the agent moved into it.")
+    try:
+        answer = input("move it there? [y/N]  (prefix+ctrl+m does this later) ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        return
+    if not promote(name, pane):
+        input("press enter to close ")
 
 
 def pick(sessions):
@@ -797,13 +979,20 @@ def refresh(workspace=None):
     workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
     if not workspace:
         sys.exit("no workspace to refresh (HERDR_WORKSPACE_ID unset)")
-    match = [w for w in herdr("workspace", "list").get("result", {}).get("workspaces", [])
-             if w["workspace_id"] == workspace]
-    name = (match[0].get("tokens") or {}).get(TOKEN) if match else None
+    info = workspace_info(workspace)
+    name = (info.get("tokens") or {}).get(TOKEN)
     if not name:
         sys.exit(f"{workspace} is not a Coder session workspace "
                  f"(no {TOKEN} token) -- nothing to refresh")
-    mirror_session(name, settings())
+    if mirror_workspace(workspace):
+        return mirror_session(name, settings())
+    # No mirror to refresh: this workspace was opened while the session sat on the
+    # clone's own branch. Moving it into a mirror is the useful thing the key can
+    # do instead, and the keypress is the consent the idle hook has to ask for.
+    pane = session_pane(workspace)
+    if not pane:
+        sys.exit(f"no agentty pane in {workspace} -- nothing to refresh or promote")
+    promote(name, pane)
 
 
 def relabel():
@@ -895,7 +1084,10 @@ def main():
     parser.add_argument("--refresh", action="store_true",
                         help="refresh the focused workspace's mirror (the plugin action)")
     parser.add_argument("--mirror", metavar="NAME",
-                        help="refresh one session's local mirror worktree, no panes")
+                        help="what a finished agent turn triggers: refresh the "
+                             "mirror, or offer one now that it is possible")
+    parser.add_argument("--promote", action="store_true",
+                        help="the pane that asks before moving a session into a mirror")
     parser.add_argument("--relabel", action="store_true",
                         help="re-apply the current label scheme to open Coder workspaces")
     parser.add_argument("--pane", action="store_true",
@@ -912,7 +1104,10 @@ def main():
         return refresh()
 
     if args.mirror:
-        return mirror_session(args.mirror, settings(), focus=False)
+        return turn_finished(args.mirror)
+
+    if args.promote:
+        return promote_pane()
 
     if args.relabel:
         return relabel()
