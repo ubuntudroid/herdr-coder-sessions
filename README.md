@@ -42,7 +42,8 @@ a second one; those rows are marked `●` in the list.
 ## Usage
 
 The list shows every Coder task whose workspace is running, with the agent's
-last reported state and message. `enter` opens or focuses, `ctrl-r` refreshes,
+last reported state and message. `enter` opens or focuses, `ctrl-o` opens the
+highlighted session in the Coder web UI, `ctrl-r` refreshes,
 and the preview pane shows the full report plus the prompt the session started
 from.
 
@@ -60,10 +61,17 @@ key = "prefix+ctrl+m"
 type = "plugin_action"
 command = "ubuntudroid.coder-sessions.refresh"
 description = "refresh this Coder mirror"
+
+[[keys.command]]
+key = "prefix+ctrl+w"
+type = "plugin_action"
+command = "ubuntudroid.coder-sessions.web"
+description = "open this Coder session in the web UI"
 ```
 
 The second key refreshes the focused session's mirror, and in a workspace that has
-none yet it moves the session into one — see [Mirroring](#mirroring).
+none yet it moves the session into one — see [Mirroring](#mirroring). The third opens
+the focused session's page in the Coder web UI — see [The web UI](#the-web-ui).
 
 Or, without installing the plugin, point a popup straight at the script:
 
@@ -83,6 +91,7 @@ The script also works standalone:
 ./coder-sessions.py                # picker
 ./coder-sessions.py --list         # rows only
 ./coder-sessions.py --open <name>  # open or focus one session
+./coder-sessions.py --web [<name>] # open a session in the Coder web UI
 ./coder-sessions.py --relabel      # re-apply the label scheme to open workspaces
 ./coder-sessions.py --selftest     # check the naming helpers
 ```
@@ -179,6 +188,21 @@ can hold several session branches and `HEAD` is unambiguous; and `git add -N` is
 capture untracked files, because it writes to the live agent's index and would show up in its
 own `git status`.
 
+## The web UI
+
+`prefix+ctrl+w` opens the focused session's page in the Coder web UI, and `ctrl-o`
+in the picker does the same for the highlighted row —
+`<deployment>/tasks/<owner>/<task id>`, the same link the UI's own task list
+builds — in the machine's default browser. That is the task page, not the
+workspace page: it has the agent's conversation, the apps, and the controls for
+pausing or restarting the session.
+
+The deployment comes from `$CODER_URL`, else the `url` file in the coder CLI's
+config dir, so it costs no network call. Like the refresh key it needs no
+argument: with no name it reads the session off the focused workspace, and refuses
+cleanly in one that is not a session's. Stopped sessions still open — their page
+is where you start them again.
+
 ## Requirements
 
 Needed:
@@ -233,6 +257,7 @@ Nothing here fails with a traceback; each degrades to the next-best thing:
 | Python below 3.9 | one line naming the interpreter and its version |
 | an unwritable state dir | previews go empty and the mirror offer repeats each turn; the picker still works |
 | an `agentty` that lost its executable bit | it runs through the interpreter instead |
+| a coder CLI that was never logged in | the web-UI key says so and names `CODER_URL`; everything else still works |
 
 ## agentty
 

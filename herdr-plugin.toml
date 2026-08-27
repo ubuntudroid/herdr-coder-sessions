@@ -39,3 +39,12 @@ id = "promote"
 title = "Coder sessions: mirror this session?"
 placement = "split"
 command = ["python3", "coder-sessions.py", "--promote"]
+
+# Open the focused session's page in the Coder web UI, in the default browser.
+# Bound to prefix+ctrl+w. Read-only, so it settles for the workspace label when
+# the metadata token has not survived a herdr restart.
+[[actions]]
+id = "web"
+title = "Coder sessions: open this session in the web UI"
+contexts = ["workspace", "tab", "pane"]
+command = ["python3", "coder-sessions.py", "--web"]

@@ -13,6 +13,8 @@ that is already open focuses its workspace instead of building a second one.
     coder-sessions.py --mirror NAME    what a finished agent turn triggers: refresh
                                        the mirror, or offer one once it is possible
     coder-sessions.py --refresh        same, for the focused workspace (plugin action)
+    coder-sessions.py --web [NAME]     open a session in the Coder web UI: the one
+                                       named, else the focused workspace's
     coder-sessions.py --promote        the pane that asks before moving a session
     coder-sessions.py --relabel        re-apply the label scheme to open workspaces
     coder-sessions.py --selftest       check the naming helpers
@@ -34,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+import webbrowser
 from datetime import datetime, timezone
 
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
@@ -145,6 +148,39 @@ def running_sessions(running_only=True):
     if not running_only:
         return tasks
     return [t for t in tasks if t.get("workspace_status") == "running"]
+
+
+def coder_url():
+    """The deployment the coder CLI is logged in to.
+
+    Read out of the CLI's own config rather than asked for over the network:
+    `coder whoami` spends a round trip to print the same string. The mac config
+    dir is tried on every platform -- it simply is not there on Linux -- so the
+    lookup needs no platform test.
+    """
+    if os.environ.get("CODER_URL"):
+        return os.environ["CODER_URL"].strip()
+    dirs = [os.environ.get("CODER_CONFIG_DIR"),
+            os.path.expanduser("~/Library/Application Support/coderv2"),
+            os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                         or os.path.expanduser("~/.config"), "coderv2")]
+    for base in filter(None, dirs):
+        try:
+            with open(os.path.join(base, "url")) as handle:
+                return handle.read().strip()
+        except OSError:
+            continue
+    sys.exit("could not find the Coder deployment: no CODER_URL, and no `url` "
+             "in the coder CLI's config dir -- is `coder login` done?")
+
+
+def task_url(task, base):
+    """The task's page in the Coder web UI, in the shape the UI's own links use.
+
+    The id is the task's own, not the workspace's: a task carries both, and they
+    are different objects with different ids.
+    """
+    return f"{base.rstrip('/')}/tasks/{task['owner_name']}/{task['id']}"
 
 
 METADATA_SOURCE = "coder-sessions"
@@ -959,10 +995,14 @@ def pick(sessions):
     width = shutil.get_terminal_size((120, 40)).columns
     proc = subprocess.run(
         ["fzf", "--ansi", "--delimiter=\t", "--with-nth=2..",
-         "--header=enter: open or focus    ctrl-r: refresh    ● already open",
+         "--header=enter: open or focus    ctrl-o: web UI    "
+         "ctrl-r: refresh    ● already open",
          "--preview", f"{SELF} --show {{1}}",
          "--preview-window=right,50%,wrap",
-         "--bind", f"ctrl-r:reload({SELF} --list)"],
+         "--bind", f"ctrl-r:reload({SELF} --list)",
+         # execute, not execute-silent: the browser prints nothing on success,
+         # and a failure needs the terminal to be read on.
+         "--bind", f"ctrl-o:execute({SELF} --web {{1}})"],
         input="\n".join(rows(sessions, open_workspaces(), width)),
         text=True, capture_output=True)
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -993,6 +1033,38 @@ def refresh(workspace=None):
     if not pane:
         sys.exit(f"no agentty pane in {workspace} -- nothing to refresh or promote")
     promote(name, pane)
+
+
+def web(name=None, workspace=None):
+    """Open a session's page in the Coder web UI: the picker's row, or the
+    focused workspace's session when the picker did not name one.
+
+    Naming it off the workspace falls back to the label the way
+    plugin_workspace() does, which refresh() deliberately does not: the token is
+    display-only and a herdr restart drops it, and opening a link cannot damage
+    what a wrong guess lands on.
+    """
+    if not name:
+        workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
+        if not workspace:
+            sys.exit("no session named, and no workspace to read one off "
+                     "(HERDR_WORKSPACE_ID unset)")
+        info = workspace_info(workspace)
+        label = info.get("label", "")
+        name = ((info.get("tokens") or {}).get(TOKEN)
+                or (label.split()[-1] if label else ""))
+        if not name:
+            sys.exit(f"{workspace} is not a Coder session workspace -- nothing to open")
+    # Before the task list, so a CLI that was never logged in is answered by the
+    # sentence naming CODER_URL rather than by `coder task list` failing first.
+    base = coder_url()
+    # Stopped sessions count: their page is where you start them again.
+    task = next((t for t in running_sessions(False) if t.get("name") == name), None)
+    if not task:
+        sys.exit(f"{name} is not in `coder task list` -- nothing to open")
+    url = task_url(task, base)
+    if not webbrowser.open(url):
+        note(f"no browser to open it in -- the session is at {url}")
 
 
 def relabel():
@@ -1065,6 +1137,10 @@ def selftest():
         == "C■ PROJ-42 · example-task-4f21"
     assert workspace_label(sess(display_name="tackle PROJ-42"),
                            branch="feat/team2-7-thing") == "C■ TEAM2-7 · example-task-4f21"
+    assert task_url({"owner_name": "someone", "id": "62a38be6-ebc1"},
+                    "https://coder.example.com/") \
+        == "https://coder.example.com/tasks/someone/62a38be6-ebc1"
+
     assert workspace_label(sess()) == "C■ example-task-4f21"  # no better name to use
     long = workspace_label(sess(display_name="a really long summary with no ticket in it"))
     assert long == "C■ a really lon… · example-task-4f21", long
@@ -1083,6 +1159,9 @@ def main():
     parser.add_argument("--selftest", action="store_true", help="check the pure helpers")
     parser.add_argument("--refresh", action="store_true",
                         help="refresh the focused workspace's mirror (the plugin action)")
+    parser.add_argument("--web", nargs="?", const="", metavar="NAME",
+                        help="open a session in the Coder web UI; without NAME, "
+                             "the focused workspace's session")
     parser.add_argument("--mirror", metavar="NAME",
                         help="what a finished agent turn triggers: refresh the "
                              "mirror, or offer one now that it is possible")
@@ -1102,6 +1181,9 @@ def main():
 
     if args.refresh:
         return refresh()
+
+    if args.web is not None:  # --web with no NAME is "", which is not None
+        return web(args.web or None)
 
     if args.mirror:
         return turn_finished(args.mirror)
