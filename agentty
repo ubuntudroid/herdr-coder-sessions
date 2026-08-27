@@ -89,15 +89,52 @@ def free_port():
     return port
 
 
+def ssh_forward(host, remote_port, local, stderr):
+    """ssh -N -L <local>:127.0.0.1:<remote_port> host.
+
+    The keepalives are what make a dead link an exit: without them ssh survives
+    one as a local listener that accepts and then hangs, and keep_tunnel never
+    gets the exit it acts on.
+    """
+    return subprocess.Popen(
+        ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+         "-L", f"{local}:127.0.0.1:{remote_port}", host],
+        stdout=subprocess.DEVNULL, stderr=stderr,
+    )
+
+
+def keep_tunnel(host, remote_port, local, holder, st):
+    """Respawn the forward when ssh exits, on the same local port.
+
+    A laptop sleep, a network drop, or a workspace restart kills ssh. The
+    request loops already retry, but they retry a port nothing listens on any
+    more, so every attempt fails with ECONNREFUSED and the screen sits in
+    "reconnecting" until the pane is restarted by hand.
+
+    ponytail: the same local port every time, so the request loops keep their
+    base URL. If something else has taken it meanwhile the respawn fails and
+    retries once a second; give up and rebuild base if that is ever seen.
+    """
+    while not st.stop:
+        proc = holder[0]
+        if proc.stderr:
+            proc.stderr.read()  # an undrained pipe wedges ssh at 64KB; EOF = exit
+        proc.wait()
+        time.sleep(1)  # a workspace that is down stays down; don't spin on it
+        if st.stop:
+            return
+        holder[0] = ssh_forward(host, remote_port, local, subprocess.DEVNULL)
+        if st.stop:  # main is already past its own terminate()
+            holder[0].terminate()
+            return
+
+
 def open_tunnel(host, remote_port):
-    """ssh -N -L <local>:127.0.0.1:<remote_port> host. Returns (proc, local_port)."""
+    """Open the forward and wait for it. Returns (proc, local_port)."""
     local = free_port()
     try:
-        proc = subprocess.Popen(
-            ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
-             "-L", f"{local}:127.0.0.1:{remote_port}", host],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
+        proc = ssh_forward(host, remote_port, local, subprocess.PIPE)
     except FileNotFoundError:
         sys.exit("ssh is not installed, or not on this PATH; pass an "
                  "already-forwarded host:port instead")
@@ -153,7 +190,10 @@ def report_agent(label, state, seq, message=None):
 
 def watch_status(base, label, st):
     """Report the agent's status to herdr: once from /status, then on each change."""
-    seq = 0
+    # Seeded from the clock, not 0: herdr drops any report whose seq is below the
+    # one it holds, so a restarted client counting from 0 sits under the previous
+    # run's last seq and the pane keeps that run's stale dot.
+    seq = int(time.time())
     while not st.stop:
         try:
             with urllib.request.urlopen(base + "/status") as resp:
@@ -632,10 +672,15 @@ def main():
         host, _, port = target.partition(":")
         base = f"http://{host}:{port or remote_port}"
     else:
-        tunnel, local = open_tunnel(target, remote_port)
+        proc, local = open_tunnel(target, remote_port)
+        tunnel = [proc]  # keep_tunnel replaces it; the exit path terminates it
         base = f"http://127.0.0.1:{local}"
 
     st = State()
+    if tunnel:
+        threading.Thread(target=keep_tunnel,
+                         args=(target, remote_port, local, tunnel, st),
+                         daemon=True).start()
     echo = not os.environ.get("AGENTTY_NO_ECHO")
     outbox = queue.Queue()
     threading.Thread(target=read_screen, args=(base, st), daemon=True).start()
@@ -713,7 +758,7 @@ def main():
                             "--source", "agentty", "--agent", label],
                            capture_output=True)
         if tunnel:
-            tunnel.terminate()
+            tunnel[0].terminate()
 
 
 if __name__ == "__main__":
