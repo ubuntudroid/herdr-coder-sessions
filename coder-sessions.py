@@ -16,15 +16,21 @@ that is already open focuses its workspace instead of building a second one.
     coder-sessions.py --web [NAME]     open a session in the Coder web UI: the one
                                        named, else the focused workspace's
     coder-sessions.py --promote        the pane that asks before moving a session
-    coder-sessions.py --relabel        re-apply the label scheme to open workspaces
+    coder-sessions.py --restamp        re-publish the sidebar tokens on open workspaces
     coder-sessions.py --selftest       check the naming helpers
 
 `coder task list` costs ~700ms, too slow to run per keystroke, so --list writes
 a cache that --show reads back.
 
+The session's identity goes in `report-metadata` tokens, never in the workspace
+label: the label is one slot every plugin writes to, while tokens are placed and
+styled per plugin by `ui.sidebar.spaces.rows`. See the README for the snippet --
+a plugin cannot add it for you.
+
 Settings, all optional, in $HERDR_PLUGIN_CONFIG_DIR/config.json:
 
-    {"host_suffix": ".coder", "clone_root": "~/projects/github", "mirror": true}
+    {"host_suffix": ".coder", "clone_root": "~/projects/github", "mirror": true,
+     "tokens": {"icon": "coder_icon", "ticket": "coder_ticket", "name": "coder"}}
 """
 
 import argparse
@@ -62,6 +68,16 @@ DEFAULTS = {
     "host_suffix": ".coder",  # ssh host is <session name> + this
     "clone_root": "~/projects/github",  # <clone_root>/<owner>/<repo>, as gh-dash maps it
     "mirror": True,        # mirror the session into a local worktree when we can
+    # Sidebar metadata token names, rendered by `ui.sidebar.spaces.rows` as `$name`.
+    # Renameable because the token namespace is global: `--source` scopes the seq
+    # counter only, so two plugins publishing the same name overwrite each other,
+    # and either one clearing it takes the other's value with it. Set one to ""
+    # to stop publishing that token.
+    "tokens": {
+        "icon": "coder_icon",      # C■, marking the workspace as mirroring a Coder one
+        "ticket": "coder_ticket",  # the ticket the branch or task names, else a summary
+        "name": "coder",           # the Coder session name -- also this plugin's key
+    },
 }
 
 DIM, BOLD, RESET = "\x1b[2m", "\x1b[1m", "\x1b[0m"
@@ -69,16 +85,28 @@ STATE_COLOR = {"idle": "\x1b[32m", "working": "\x1b[33m",
                "complete": "\x1b[32m", "failure": "\x1b[31m", "error": "\x1b[31m"}
 
 
+def merge_settings(user):
+    """DEFAULTS overlaid with the user's config.json.
+
+    `tokens` is merged rather than replaced: renaming one token should not
+    silently drop the other two, which the flat update the rest of the settings
+    get would do.
+    """
+    merged = dict(DEFAULTS, **user)
+    merged["tokens"] = dict(DEFAULTS["tokens"], **(user.get("tokens") or {}))
+    return merged
+
+
 def settings():
     path = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
-    merged = dict(DEFAULTS)
+    user = {}
     if path:
         try:
             with open(os.path.join(path, "config.json")) as handle:
-                merged.update(json.load(handle))
+                user = json.load(handle)
         except (OSError, ValueError):
             pass  # absent or malformed config just means defaults
-    return merged
+    return merge_settings(user)
 
 
 def config_hint():
@@ -136,8 +164,8 @@ def agentty_cmd():
 
 def running_sessions(running_only=True):
     """Coder tasks. By default only those whose workspace is up, so agentapi is
-    reachable; pass False when naming workspaces, where a stopped session's
-    ticket is still the best label."""
+    reachable; pass False when stamping workspace tokens, where a stopped
+    session's ticket is still worth showing."""
     out = run(["coder", "task", "list", "-o", "json"])
     start = out.find("[")
     try:
@@ -184,10 +212,20 @@ def task_url(task, base):
 
 
 METADATA_SOURCE = "coder-sessions"
-TOKEN = "coder"
 REVIEWR = "persiyanov.reviewr"  # the review pane this plugin opens beside the agent
 
-# Ticket ids make the best workspace label. Prefixes here carry digits (CON2,
+
+def token_names(conf=None):
+    """The configured token names, defaults filled in."""
+    return (conf or settings())["tokens"]
+
+
+def name_token(conf=None):
+    """The token carrying the session name -- this plugin's handle on a workspace."""
+    return token_names(conf)["name"]
+
+
+# Ticket ids make the best thing to show. Prefixes here carry digits (CON2,
 # PGROWTH), so allow them after the first letter; skip encodings and standards
 # that share the shape.
 TICKET_RE = re.compile(r"\b(?!UTF-|ISO-|RFC-|SHA-)[A-Z][A-Z0-9]{1,9}-\d{1,5}\b")
@@ -210,7 +248,7 @@ def branch_ticket(branch):
 
 
 def readable_name(session, limit=28, branch=""):
-    """A human label for the workspace: the ticket the branch names, else one the
+    """A human name for the session: the ticket the branch names, else one the
     task names, else the task's own display name with Slack markup stripped.
 
     The branch wins because it is fixed for the life of the session, while the
@@ -232,23 +270,47 @@ def readable_name(session, limit=28, branch=""):
 
 
 ICON = "C■"  # stands in for the Coder logo: these workspaces mirror a Coder one
-SIDEBAR_MAX = 36  # `sidebar_max_width` default; the sidebar auto-scales up to it
 
 
-def workspace_label(session, branch=""):
-    """`C■ <ticket or summary> · <session name>`, kept inside the sidebar width.
+def session_tokens(session, branch="", conf=None):
+    """What this plugin puts in the sidebar: `{token name: value}`, "" to clear.
 
-    The sidebar shows one line per workspace: the branch line on worktree
-    workspaces is herdr's own, `--cwd` inside a repo does not earn one, and
-    metadata tokens never render -- so the identifier has to share the label.
+    Three tokens rather than one string, so the user's `ui.sidebar.spaces.rows`
+    decides where each piece goes and how it is styled. The workspace label is
+    left alone -- it is one slot every plugin writes to, and herdr-git-status is
+    already prepending to it.
     """
-    name = session["name"]
-    # icon + its space + " · " + a column for "…" on a truncated summary
-    head = readable_name(session, limit=max(8, SIDEBAR_MAX - len(ICON) - len(name) - 5),
-                         branch=branch)
-    if head == name:
-        return f"{ICON} {name}"  # nothing better to say than the name itself
-    return f"{ICON} {head} · {name}"
+    names = token_names(conf)
+    head = readable_name(session, branch=branch)
+    return {
+        names["icon"]: ICON,
+        # Nothing better to say than the name itself: cleared, so the row does not
+        # show the session name twice.
+        names["ticket"]: "" if head == session["name"] else head,
+        names["name"]: session["name"],
+    }
+
+
+def report_tokens(workspace, values, conf=None):
+    """Publish (or clear, on "") this plugin's tokens on a workspace, in one call.
+
+    No `--seq`: a report without one is always accepted, and this plugin has no
+    ordering to defend -- every write is the latest state of one session. No
+    `--ttl-ms`: nothing here ticks, so an expiry would blank the row seconds after
+    the event that wrote it, with nothing left to refresh it.
+    """
+    args = []
+    for token, value in values.items():
+        if not token:
+            continue  # the user turned this one off
+        args += ["--clear-token", token] if value == "" else ["--token", f"{token}={value}"]
+    if args:
+        herdr("workspace", "report-metadata", workspace, "--source", METADATA_SOURCE, *args)
+
+
+def clear_tokens(workspace, conf=None):
+    """Drop every token this plugin owns on a workspace."""
+    report_tokens(workspace, {t: "" for t in token_names(conf).values()}, conf)
 
 
 MIRROR_MARK = "coder-mirror"  # marks a worktree as derived, so refreshing may reset it
@@ -585,22 +647,53 @@ def apply_session_changes(host, repo, checkout, base):
     note(f"  applied vs {base[:12]}: " + (", ".join(bits) or "nothing"))
 
 
-def open_workspaces():
+def pane_sessions(workspace=None):
+    """herdr workspace id -> the session name agentty is running in it.
+
+    herdr's own agent detection reads the session off the agentty pane and reports
+    it as that pane's `agent` (`"agent": "asked-in-db1a"`), which is what still
+    identifies a workspace after a herdr restart has dropped the display-only
+    tokens. One call covers every workspace: each pane comes back with its own
+    `workspace_id`.
+
+    A name here is a candidate, not proof -- every other agent pane reports its
+    program instead (`claude`) -- so anything acted on is checked against the
+    sessions that actually exist.
+    """
+    args = ["pane", "list"] + (["--workspace", workspace] if workspace else [])
+    found = {}
+    for pane in herdr(*args).get("result", {}).get("panes", []):
+        if pane.get("agent") and pane.get("workspace_id"):
+            found.setdefault(pane["workspace_id"], pane["agent"])
+    return found
+
+
+def open_workspaces(sessions=None):
     """Coder session name -> herdr workspace id.
 
-    Keyed off the metadata token this plugin stamps, so the label stays free to
-    be human-readable; the label is a fallback for workspaces made before that.
+    Keyed off the metadata token this plugin stamps. Tokens are display-only and
+    a herdr restart drops them, so a workspace carrying none falls back to the
+    session name on its agentty pane.
+
+    Given `sessions`, a workspace recovered that way is re-stamped on the spot:
+    that is what refills the sidebar after a restart, and it is gated on the list
+    because without it there is no telling a session's pane from any other agent's.
     """
-    result = herdr("workspace", "list").get("result", {})
+    conf = settings()
+    token = name_token(conf)
+    known = {s["name"]: s for s in sessions} if sessions is not None else {}
+    by_pane = None
     found = {}
-    for w in result.get("workspaces", []):
-        label = w.get("label", "")
-        # The token is the reliable handle, but `report-metadata` is display-only
-        # and does not survive a herdr restart, so fall back to the label, whose
-        # last word is the session name -- until another plugin rewrites the label
-        # wholesale (herdr-git-status does), which is why the pane, not the label,
-        # is what agentty_running() asks before running anything.
-        name = (w.get("tokens") or {}).get(TOKEN) or (label.split()[-1] if label else "")
+    for w in herdr("workspace", "list").get("result", {}).get("workspaces", []):
+        name = (w.get("tokens") or {}).get(token)
+        if not name:
+            if by_pane is None:
+                by_pane = pane_sessions()
+            name = by_pane.get(w["workspace_id"], "")
+            if name in known:
+                branch = checkout_branch((w.get("worktree") or {}).get("checkout_path"))
+                report_tokens(w["workspace_id"],
+                              session_tokens(known[name], branch, conf), conf)
         if name:
             found.setdefault(name, w["workspace_id"])
     return found
@@ -630,13 +723,13 @@ def plugin_workspace(workspace, name):
 
     Read off that workspace, never looked up by name: while a session is being
     moved, two workspaces answer to it, and only one of them is the one being
-    left. The label is the fallback open_workspaces() uses too, for after a herdr
-    restart has dropped the display-only token.
+    left. The agentty pane is the fallback open_workspaces() uses too, for after
+    a herdr restart has dropped the display-only token. `name` is already known
+    to be a session's, so matching it needs no further check.
     """
-    info = workspace_info(workspace)
-    label = info.get("label", "")
-    return ((info.get("tokens") or {}).get(TOKEN) == name
-            or (label.split()[-1] if label else "") == name)
+    if (workspace_info(workspace).get("tokens") or {}).get(name_token()) == name:
+        return True
+    return pane_sessions(workspace).get(workspace) == name
 
 
 def last_pane(workspace, pane):
@@ -805,7 +898,7 @@ def open_reviewr(workspace, pane, checkout):
 
 def open_session(name, sessions=None):
     """Focus this session's workspace, building it the first time."""
-    existing = open_workspaces().get(name)
+    existing = open_workspaces(sessions).get(name)
     if existing:
         herdr("workspace", "focus", existing)
         print(f"focused existing workspace {existing} for {name}")
@@ -827,29 +920,24 @@ def open_session(name, sessions=None):
 
 
 def attach_session(name, session, conf, workspace, checkout, made):
-    """Give the session a workspace: label, token, agentty, reviewr, focus.
+    """Give the session a workspace: tokens, agentty, reviewr, focus.
 
     Shared by the first open and by promote(), which is this same setup run again
     once a mirror the first open could not build has become possible.
     """
-    # Labelled after the mirror, not before: the checkout is where the session's
-    # branch, and so its ticket, can be read.
-    label = workspace_label(session, checkout_branch(checkout))
     if workspace:
         # The worktree workspace is the session's workspace: herdr gives it the
         # branch line in the sidebar, and open_reviewr() puts reviewr in it.
-        herdr("workspace", "rename", workspace, label)
         top = herdr("pane", "list", "--workspace", workspace)["result"]["panes"][0]["pane_id"]
     else:
-        created = herdr("workspace", "create", "--label", label,
+        created = herdr("workspace", "create",
                         "--cwd", os.path.expanduser("~"), "--no-focus")["result"]
         workspace = created["workspace"]["workspace_id"]
         top = created["root_pane"]["pane_id"]
-    # The Coder session name goes in a metadata token, not the label: it is the
-    # identifier, shown under the human-readable name, and it is what
-    # open_workspaces() matches on.
-    herdr("workspace", "report-metadata", workspace,
-          "--source", METADATA_SOURCE, "--token", f"{TOKEN}={name}")
+    # Stamped after the mirror, not before: the checkout is where the session's
+    # branch, and so its ticket, can be read. The workspace label is left as
+    # herdr named it -- the identity goes in tokens the user places themselves.
+    report_tokens(workspace, session_tokens(session, checkout_branch(checkout), conf), conf)
 
     host = f"{name}{conf['host_suffix']}"
     # Refresh the mirror whenever the agent finishes a turn: agentty already knows
@@ -864,10 +952,10 @@ def attach_session(name, session, conf, workspace, checkout, made):
     # a REPL -- still gets typed into; widen to "anything but the shell" once that
     # is checked against a genuinely idle shell, which reports no foreground child.
     if pane_running(top, "agentty"):
-        note(f"focused {workspace} \"{label}\" for {name}: agentty already in {top}")
+        note(f"focused {workspace} for {name}: agentty already in {top}")
     else:
         herdr("pane", "run", top, f"{hook}{agentty_cmd()} {host}")
-        note(f"opened {workspace} \"{label}\" for {name}: agentty in {top}")
+        note(f"opened {workspace} for {name}: agentty in {top}")
     if checkout and not made:
         open_reviewr(workspace, top, checkout)  # a fresh worktree gets reviewr's own event
     herdr("workspace", "focus", workspace)
@@ -875,7 +963,7 @@ def attach_session(name, session, conf, workspace, checkout, made):
 
 
 def session_named(name):
-    """The session's description, for the label: the picker's cache, else the CLI."""
+    """The session's description, for its tokens: the picker's cache, else the CLI."""
     for session in cache_read():
         if session["name"] == name:
             return session
@@ -901,10 +989,10 @@ def promote(name, pane):
         return None  # mirror_session has already said why
     attach_session(name, session_named(name), conf, workspace, checkout, made)
     if old and old != workspace:
-        # The token is what open_workspaces() matches on: left behind, the picker
-        # would go on focusing the workspace the session has just left.
-        herdr("workspace", "report-metadata", old, "--source", METADATA_SOURCE,
-              "--clear-token", TOKEN)
+        # The tokens are what open_workspaces() matches on, and what the sidebar
+        # draws: left behind, the picker would go on focusing the workspace the
+        # session has just left, and its row would still name the session.
+        clear_tokens(old, conf)
     if ours or not last_pane(old, pane):
         herdr("pane", "close", pane)  # last: this can take the tab we run in with it
     else:
@@ -1003,7 +1091,7 @@ def pick(sessions):
          # execute, not execute-silent: the browser prints nothing on success,
          # and a failure needs the terminal to be read on.
          "--bind", f"ctrl-o:execute({SELF} --web {{1}})"],
-        input="\n".join(rows(sessions, open_workspaces(), width)),
+        input="\n".join(rows(sessions, open_workspaces(sessions), width)),
         text=True, capture_output=True)
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
@@ -1019,11 +1107,11 @@ def refresh(workspace=None):
     workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
     if not workspace:
         sys.exit("no workspace to refresh (HERDR_WORKSPACE_ID unset)")
-    info = workspace_info(workspace)
-    name = (info.get("tokens") or {}).get(TOKEN)
+    token = name_token()
+    name = (workspace_info(workspace).get("tokens") or {}).get(token)
     if not name:
         sys.exit(f"{workspace} is not a Coder session workspace "
-                 f"(no {TOKEN} token) -- nothing to refresh")
+                 f"(no {token} token) -- nothing to refresh")
     if mirror_workspace(workspace):
         return mirror_session(name, settings())
     # No mirror to refresh: this workspace was opened while the session sat on the
@@ -1039,20 +1127,19 @@ def web(name=None, workspace=None):
     """Open a session's page in the Coder web UI: the picker's row, or the
     focused workspace's session when the picker did not name one.
 
-    Naming it off the workspace falls back to the label the way
+    Naming it off the workspace falls back to the agentty pane the way
     plugin_workspace() does, which refresh() deliberately does not: the token is
     display-only and a herdr restart drops it, and opening a link cannot damage
-    what a wrong guess lands on.
+    what a wrong guess lands on. `coder task list` rejects a name that is not a
+    session's, which is the check the fallback itself cannot make.
     """
     if not name:
         workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
         if not workspace:
             sys.exit("no session named, and no workspace to read one off "
                      "(HERDR_WORKSPACE_ID unset)")
-        info = workspace_info(workspace)
-        label = info.get("label", "")
-        name = ((info.get("tokens") or {}).get(TOKEN)
-                or (label.split()[-1] if label else ""))
+        name = ((workspace_info(workspace).get("tokens") or {}).get(name_token())
+                or pane_sessions(workspace).get(workspace, ""))
         if not name:
             sys.exit(f"{workspace} is not a Coder session workspace -- nothing to open")
     # Before the task list, so a CLI that was never logged in is answered by the
@@ -1067,34 +1154,40 @@ def web(name=None, workspace=None):
         note(f"no browser to open it in -- the session is at {url}")
 
 
-def relabel():
-    """Bring every Coder workspace up to the current label scheme.
+def restamp():
+    """Re-publish this plugin's sidebar tokens on every workspace running a session.
 
-    Idempotent, and it also stamps the metadata token on workspaces opened
-    before that existed -- those are recognised by their label still being the
-    bare session name.
+    Idempotent, and the explicit form of what open_workspaces() does on its own
+    when the picker runs: tokens are display-only, so a herdr restart drops them
+    all and the sidebar rows go blank until something writes them again.
+
+    Workspaces are found by the session name on their agentty pane, checked
+    against the sessions that exist, so this also reaches one whose token was
+    never stamped -- opened before the token existed, or by an older version.
     """
+    conf = settings()
     known = {s["name"]: s for s in (describe(t) for t in running_sessions(False))}
+    by_pane = pane_sessions()
+    token = name_token(conf)
     changes = 0
     for w in herdr("workspace", "list").get("result", {}).get("workspaces", []):
+        workspace = w["workspace_id"]
         tokens = w.get("tokens") or {}
-        name = tokens.get(TOKEN) or w.get("label", "")
+        name = tokens.get(token) or by_pane.get(workspace, "")
         session = known.get(name)
         if not session:
             continue
-        wanted = workspace_label(
-            session, checkout_branch((w.get("worktree") or {}).get("checkout_path")))
-        if w.get("label") != wanted:
-            herdr("workspace", "rename", w["workspace_id"], wanted)
-            print(f"{w['workspace_id']}: {w.get('label')!r} -> {wanted!r}")
-            changes += 1
-        if tokens.get(TOKEN) != name:
-            herdr("workspace", "report-metadata", w["workspace_id"],
-                  "--source", METADATA_SOURCE, "--token", f"{TOKEN}={name}")
-            print(f"{w['workspace_id']}: tagged {TOKEN}={name}")
-            changes += 1
+        branch = checkout_branch((w.get("worktree") or {}).get("checkout_path"))
+        wanted = session_tokens(session, branch, conf)
+        # "" means clear, and a token already absent is already cleared.
+        if all(tokens.get(t, "") == v for t, v in wanted.items() if t):
+            continue
+        report_tokens(workspace, wanted, conf)
+        print(f"{workspace}: stamped " + ", ".join(f"{t}={v}" for t, v in wanted.items()
+                                                   if t and v))
+        changes += 1
     if not changes:
-        print("every Coder workspace label is already current")
+        print("every Coder workspace is already stamped")
 
 
 def selftest():
@@ -1133,18 +1226,26 @@ def selftest():
     assert readable_name(sess(display_name="tackle PROJ-42"),
                          branch="automations/con2-106-x") == "CON2-106"
 
-    assert workspace_label(sess(display_name="tackle PROJ-42")) \
-        == "C■ PROJ-42 · example-task-4f21"
-    assert workspace_label(sess(display_name="tackle PROJ-42"),
-                           branch="feat/team2-7-thing") == "C■ TEAM2-7 · example-task-4f21"
     assert task_url({"owner_name": "someone", "id": "62a38be6-ebc1"},
                     "https://coder.example.com/") \
         == "https://coder.example.com/tasks/someone/62a38be6-ebc1"
 
-    assert workspace_label(sess()) == "C■ example-task-4f21"  # no better name to use
-    long = workspace_label(sess(display_name="a really long summary with no ticket in it"))
-    assert long == "C■ a really lon… · example-task-4f21", long
-    assert len(long) <= SIDEBAR_MAX, (long, len(long))
+    default = DEFAULTS["tokens"]
+    assert session_tokens(sess(display_name="tackle PROJ-42")) == {
+        default["icon"]: "C■",
+        default["ticket"]: "PROJ-42",
+        default["name"]: "example-task-4f21",
+    }
+    assert session_tokens(sess(display_name="tackle PROJ-42"),
+                          branch="feat/team2-7-thing")[default["ticket"]] == "TEAM2-7"
+    # Nothing better to say than the name: the ticket token is cleared, not
+    # left showing the session name a second time.
+    assert session_tokens(sess())[default["ticket"]] == ""
+    # A partial override renames one token and keeps the other two.
+    partial = merge_settings({"tokens": {"ticket": "mine"}})
+    assert set(session_tokens(sess(), conf=partial)) \
+        == {default["icon"], "mine", default["name"]}
+    assert merge_settings({"mirror": False})["tokens"] == default
     print("selftest ok")
 
 
@@ -1167,8 +1268,8 @@ def main():
                              "mirror, or offer one now that it is possible")
     parser.add_argument("--promote", action="store_true",
                         help="the pane that asks before moving a session into a mirror")
-    parser.add_argument("--relabel", action="store_true",
-                        help="re-apply the current label scheme to open Coder workspaces")
+    parser.add_argument("--restamp", action="store_true",
+                        help="re-publish the sidebar tokens on open Coder workspaces")
     parser.add_argument("--pane", action="store_true",
                         help="open the picker as a plugin pane (what the action does)")
     parser.add_argument("--list", action="store_true", help="print rows, no picker")
@@ -1191,8 +1292,8 @@ def main():
     if args.promote:
         return promote_pane()
 
-    if args.relabel:
-        return relabel()
+    if args.restamp:
+        return restamp()
 
     if args.pane:
         # An action's command runs with no terminal, so it cannot host fzf --
@@ -1222,7 +1323,7 @@ def main():
 
     if args.list:
         width = shutil.get_terminal_size((120, 40)).columns
-        print("\n".join(rows(sessions, open_workspaces(), width)))
+        print("\n".join(rows(sessions, open_workspaces(sessions), width)))
         return
 
     chosen = pick(sessions)

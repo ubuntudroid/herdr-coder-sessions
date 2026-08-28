@@ -22,7 +22,7 @@ Nothing to build: two Python files, standard library only. See
 
 ## Layout
 
-Each session gets one workspace, labelled with the session name:
+Each session gets one workspace, named in the sidebar by [tokens](#sidebar-tokens):
 
 ```
 ┌───────────────────────────┬───────────────────┐
@@ -92,19 +92,55 @@ The script also works standalone:
 ./coder-sessions.py --list         # rows only
 ./coder-sessions.py --open <name>  # open or focus one session
 ./coder-sessions.py --web [<name>] # open a session in the Coder web UI
-./coder-sessions.py --relabel      # re-apply the label scheme to open workspaces
+./coder-sessions.py --restamp      # re-publish the sidebar tokens on open workspaces
 ./coder-sessions.py --selftest     # check the naming helpers
 ```
 
-Workspaces are labelled `C■ <ticket> · <session>`, e.g.
-`C■ PROJ-1234 · example-task-4f21`. The ticket is taken from the task's display
-name, the agent's last report, or the initial prompt; failing that the display
-name with Slack markup stripped, failing that the session name alone. The `C■`
-prefix marks a workspace as mirroring a Coder one.
+## Sidebar tokens
 
-`--relabel` is for workspaces opened before a ticket was known, or before this
-scheme existed — it renames them and stamps the `coder` metadata token that
-duplicate detection keys off. It is idempotent.
+The plugin never touches the workspace **label**. That is one slot every plugin
+writes to, so they fight over it. It publishes **metadata tokens** instead, which
+`ui.sidebar.spaces.rows` places and styles per plugin:
+
+| token | example | what it is |
+|---|---|---|
+| `$coder_icon` | `C■` | marks the workspace as mirroring a Coder one |
+| `$coder_ticket` | `PROJ-1234` | the ticket the branch names, else the one the task names, else the display name with Slack markup stripped, truncated. Cleared when there is nothing to say beyond the session name |
+| `$coder` | `example-task-4f21` | the Coder session name — also the plugin's own handle on the workspace |
+
+**A plugin cannot add these to your config.** Put them in `~/.config/herdr/config.toml`
+yourself, wherever you want them, and run `herdr server reload-config`:
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status"],
+  [{ token = "$coder_icon" }, { token = "$coder_ticket", bold = true }],
+  ["$coder"],
+]
+```
+
+Two rows, not one: on a single line the session name crowds the ticket out and it
+gets truncated. `fg` takes a strict `#RGB`/`#RRGGBB` — there are no theme colour
+names, and anything else is rejected with `invalid ui config` (herdr keeps the
+previous UI settings, so a bad value costs a reload, not your sidebar). Omitting
+`fg` uses the default foreground, which is the only thing that follows the theme.
+
+Without a label of its own, a session's workspace falls back to what herdr derives:
+the mirror's branch name, or `~` when there is no mirror. The session name appears
+nowhere but `$coder`.
+
+Token names are a **global namespace** — `--source` scopes the sequence counter,
+not the name. Two plugins publishing `$coder` would overwrite each other, and
+either one clearing it would take the other's value with it. Rename any of the
+three in the plugin's own `config.json` if something else already claims it; set
+one to `""` to stop publishing it.
+
+Tokens are display-only: a herdr restart drops them. The plugin re-stamps a
+workspace whenever the picker runs, recognising it by the session name herdr's
+agent detection reads off the agentty pane. `--restamp` is the same thing on
+demand, and is idempotent.
 
 ## What's in here
 
@@ -156,8 +192,10 @@ still there for whatever tool you prefer.
   generic — agentty knows nothing about this plugin.
 - **On demand**, with `prefix+ctrl+m` (the `refresh` action), which refreshes the focused
   workspace's mirror — or, in a workspace that has none yet, moves the session into one. It
-  reads the session name from the `coder` metadata token, so it needs no argument, and refuses
-  cleanly in a workspace that is not a session's.
+  reads the session name from the [`$coder` token](#sidebar-tokens), so it needs no argument,
+  and refuses cleanly in a workspace that is not a session's. It resets the mirror hard, so it
+  will not guess: after a herdr restart has dropped the tokens, open the picker once (or run
+  `--restamp`) to put them back.
 - **On first open**, as part of building the workspace.
 
 Re-picking an already-open session only focuses it; it does not refresh.
@@ -293,6 +331,7 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
 | `host_suffix` | `".coder"` | appended to the session name to form the ssh host |
 | `clone_root` | `"~/projects/github"` | where `<owner>/<repo>` clones live |
 | `mirror` | `true` | mirror the session into a local worktree on open |
+| `tokens` | `{"icon": "coder_icon", "ticket": "coder_ticket", "name": "coder"}` | [sidebar token](#sidebar-tokens) names. Merged with the defaults, so renaming one keeps the others; `""` stops that one being published |
 
 ## Notes
 
