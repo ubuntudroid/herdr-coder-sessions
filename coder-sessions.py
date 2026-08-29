@@ -388,6 +388,91 @@ def remote_repo(host):
     return root.strip(), branch.strip(), repo_slug(origin), shallow.strip() == "true"
 
 
+# agentapi launched the agent and names it on its own command line, which makes
+# this the one authoritative answer. Both ~/.claude and ~/.codex exist on every
+# Coder workspace, so "which history directory has files" is not a test.
+AGENT_TYPE = re.compile(r"agentapi\s+server\b[^\n]*?--type\s+(\S+)")
+
+# Picks the session's own codex rollout. Subagent threads live in the same tree
+# and carry the parent's session_id, so `thread_source` is the discriminator;
+# `cwd` keeps a second checkout on the same box out of it. Run on the workspace
+# because that is where the files are, and because shipping 19 candidates back
+# to choose between them would be absurd.
+CODEX_PICK = """
+import json, glob, os, sys
+best = ("", 0.0)
+for path in glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/*.jsonl")):
+    try:
+        with open(path) as handle:
+            meta = json.loads(handle.readline()).get("payload") or {}
+    except (OSError, ValueError):
+        continue
+    if meta.get("thread_source") != "user" or meta.get("cwd") != sys.argv[1]:
+        continue
+    stamp = os.path.getmtime(path)
+    if stamp > best[1]:
+        best = (path, stamp)
+print(best[0])
+"""
+
+# Claude Code files one transcript per session under an encoded copy of the cwd,
+# so the directory is known and only the file is in question. The branch is what
+# tells the session's transcript from an earlier one in the same checkout; mtime
+# breaks a tie, and stands alone on a session that never branched.
+CLAUDE_PICK = """
+import json, glob, os, sys
+best, fallback = ("", 0.0), ("", 0.0)
+for path in glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"),
+                                   sys.argv[1], "*.jsonl")):
+    stamp = os.path.getmtime(path)
+    if stamp > fallback[1]:
+        fallback = (path, stamp)
+    try:
+        with open(path) as handle:
+            branches = {json.loads(line).get("gitBranch") for line in handle}
+    except (OSError, ValueError):
+        continue
+    if sys.argv[2] in branches and stamp > best[1]:
+        best = (path, stamp)
+print(best[0] or fallback[0])
+"""
+
+
+def claude_dir(path):
+    """Claude Code's project-directory encoding: every non-alphanumeric becomes a dash."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def remote_agent(host):
+    """Which agent agentapi started on the session -- "codex", "claude" -- or ""."""
+    line = ssh_out(host, "ps -eo args= | grep -m1 'agentapi server'", check=False)
+    found = AGENT_TYPE.search(line or "")
+    return found.group(1) if found else ""
+
+
+def history_path(host, kind, repo, branch):
+    """Where this session's own history file sits on the workspace, or ""."""
+    if kind == "codex":
+        # Get the actual working directory of the agentapi process to match against
+        # stored session cwds in the history files. The agent may run in a subdirectory
+        # of the repo, so we need the actual pwd, not just the git root.
+        cwd_cmd = "python3 << 'GETCWD'\nimport subprocess, os\npids = subprocess.run(['pgrep', '-f', 'agentapi server'], capture_output=True, text=True).stdout.strip().split()\npid = pids[0] if pids else None\ntry:\n    print(os.readlink(f'/proc/{pid}/cwd') if pid else '', end='')\nexcept:\n    print('', end='')\nGETCWD"
+        actual_cwd = ssh_out(host, cwd_cmd, check=False).strip()
+        script, args = CODEX_PICK, [actual_cwd or repo]
+    elif kind == "claude":
+        script, args = CLAUDE_PICK, [claude_dir(repo), branch]
+    else:
+        return ""
+    quoted = " ".join(shlex.quote(arg) for arg in args)
+    return ssh_out(host, f"python3 -c {shlex.quote(script)} {quoted}",
+                   check=False).strip()
+
+
+def history_text(host, path):
+    """The history file's bytes. Multi-megabyte and read once, so no streaming."""
+    return ssh_out(host, f"cat {shlex.quote(path)}", check=False)
+
+
 def connected(clone, sha):
     """Is `sha` in the clone *with* its history?
 
@@ -1419,6 +1504,11 @@ def selftest():
     assert "/local/wt" in body
     assert "- `Bash: ls`" in body
     assert body.index("## User") < body.index("## Assistant")
+
+    assert claude_dir("/home/coder/content_backend/backend") == \
+        "-home-coder-content-backend-backend"
+    assert claude_dir("/Users/me/.config/x") == "-Users-me--config-x"
+
     print("selftest ok")
 
 
