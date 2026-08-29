@@ -782,6 +782,128 @@ def describe(task):
     }
 
 
+# Where the handover lands inside the taken-over worktree. A dotfile at the root
+# rather than a directory: one file to read, one line in .git/info/exclude, and
+# nothing left behind if the user deletes it.
+TAKEOVER_FILE = ".coder-takeover.md"
+
+
+def summarise(value, limit=120):
+    """One line standing in for a tool call's input: whitespace collapsed, clipped."""
+    text = " ".join(str(value).split())
+    return text[:limit] + "…" if len(text) > limit else text
+
+
+def render_codex(text):
+    """`[(role, body)]` from a codex rollout: the conversation, no tool output.
+
+    Kept: `message` payloads whose role is user or assistant, and a one-line note
+    of each tool call. Dropped: every `*_output`, `reasoning` (its content is
+    encrypted and useless to another agent), `agent_message` (subagent chatter),
+    and role `developer` (codex's own skills prompt, which the local agent has its
+    own version of). That is 97% of the bytes and none of the meaning -- see the
+    plan's measurements.
+    """
+    turns = []
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # a half-written tail line, not a reason to lose the rest
+        if entry.get("type") != "response_item":
+            continue  # `event_msg` outnumbers it 689 to 727 and shares payload shapes
+        payload = entry.get("payload") or {}
+        kind = payload.get("type")
+        if kind == "message":
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            body = "".join(block.get("text", "") for block in payload.get("content") or []
+                           if isinstance(block, dict)).strip()
+            if body:
+                turns.append((role, body))
+        elif kind in ("function_call", "custom_tool_call"):
+            # `input` for custom tools, `arguments` for function calls -- same idea,
+            # different key, and neither is worth a branch of its own.
+            arg = payload.get("input") or payload.get("arguments") or ""
+            turns.append(("tool", f"{payload.get('name') or kind}: {summarise(arg)}"))
+    return turns
+
+
+def render_claude(text):
+    """`[(role, body)]` from a Claude Code transcript: the conversation, no tool output.
+
+    `message.content` is a bare string for a typed prompt and a list of blocks
+    otherwise, so both shapes are handled. `thinking` blocks carry a signature and
+    no readable text; `tool_result` is the output we are deliberately dropping.
+    """
+    turns = []
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        role = entry.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if isinstance(content, str):
+            if content.strip():
+                turns.append((role, content.strip()))
+            continue
+        for block in content or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and block.get("text", "").strip():
+                turns.append((role, block["text"].strip()))
+            elif block.get("type") == "tool_use":
+                turns.append(("tool", f"{block.get('name')}: {summarise(block.get('input'))}"))
+    return turns
+
+
+def transcript(turns, name, host, kind, checkout, branch, repo):
+    """The markdown the local agent is handed.
+
+    The header is the whole point of the feature: without it the agent reads a
+    conversation in the first person and takes it for its own, then trusts tool
+    output it never saw and paths that do not exist here. It says three things --
+    this ran somewhere else, the code in front of you is already the result, and
+    the machine it ran on is reachable but is a last resort.
+    """
+    lines = [
+        f"# Handover from Coder session `{name}`",
+        "",
+        "**This is a rendering of a conversation that ran on a remote machine, not",
+        f"on this one.** The agent was `{kind}`, working in `{repo}` on branch",
+        f"`{branch}` of the Coder workspace `{name}`. It was not you.",
+        "",
+        f"You are continuing that work **locally**, in `{checkout}`, on the same",
+        "branch. The session's commits and its uncommitted changes are already",
+        "applied there, so the code in front of you is the state that agent left.",
+        "Nothing else about the remote machine is reproduced here.",
+        "",
+        "**Tool outputs are not included below** -- only what was said, plus a",
+        "one-line note of each tool call. If you need a result, re-run the command",
+        "locally. That is almost always faster than asking the remote, and the",
+        "worktree already holds the work the commands produced.",
+        "",
+        f"The remote machine is still reachable as `ssh {host}`, for the cases where",
+        "something genuinely cannot be reproduced here: an environment-specific",
+        "failure, a service that only runs there, a file outside the repository.",
+        "It may take ~30s to answer if Coder has stopped it. Do not reach for it for",
+        "anything you can do in this worktree.",
+        "",
+        "---",
+        "",
+    ]
+    for role, body in turns:
+        if role == "tool":
+            lines += [f"- `{body}`", ""]
+        else:
+            lines += [f"## {role.capitalize()}", "", body, ""]
+    return "\n".join(lines)
+
+
 def rows(sessions, opened, width):
     """One fzf line per session: plain name, TAB, then the display columns."""
     out = []
@@ -1246,6 +1368,57 @@ def selftest():
     assert set(session_tokens(sess(), conf=partial)) \
         == {default["icon"], "mine", default["name"]}
     assert merge_settings({"mirror": False})["tokens"] == default
+
+    # Take over locally: the renderers, on one line of each shape that matters.
+    codex_lines = "\n".join(json.dumps(entry) for entry in [
+        {"type": "session_meta", "payload": {"cwd": "/repo", "thread_source": "user"}},
+        {"type": "response_item", "payload": {"type": "message", "role": "developer",
+                                              "content": [{"text": "skills prompt"}]}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                              "content": [{"text": "fix the validator"}]}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec",
+                                              "input": "pytest  -q\n  backend/"}},
+        {"type": "response_item", "payload": {"type": "reasoning",
+                                              "encrypted_content": "opaque"}},
+        {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                                              "content": [{"text": "Done."}]}},
+    ])
+    assert render_codex(codex_lines) == [
+        ("user", "fix the validator"),
+        ("tool", "exec: pytest -q backend/"),
+        ("assistant", "Done."),
+    ], render_codex(codex_lines)
+
+    claude_lines = "\n".join(json.dumps(entry) for entry in [
+        {"type": "summary", "summary": "ignored"},
+        {"type": "user", "message": {"content": "review this branch"}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "..."},
+            {"type": "text", "text": "Looking now."},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "git  diff"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "x", "content": "a diff"}]}},
+    ])
+    assert render_claude(claude_lines) == [
+        ("user", "review this branch"),
+        ("assistant", "Looking now."),
+        ("tool", "Bash: {'command': 'git diff'}"),
+    ], render_claude(claude_lines)
+
+    # Malformed lines are skipped, never fatal: a truncated tail is normal in a
+    # file the remote agent may still be writing.
+    assert render_codex("not json\n") == []
+    assert render_claude("{broken\n") == []
+
+    body = transcript([("user", "go"), ("tool", "Bash: ls"), ("assistant", "done")],
+                      name="task-1a2b", host="task-1a2b.coder", kind="codex",
+                      checkout="/local/wt", branch="feat/x", repo="/home/coder/r")
+    assert "ran on a remote machine" in body
+    assert "ssh task-1a2b.coder" in body
+    assert "/local/wt" in body
+    assert "- `Bash: ls`" in body
+    assert body.index("## User") < body.index("## Assistant")
     print("selftest ok")
 
 
