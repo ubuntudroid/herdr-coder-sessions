@@ -272,7 +272,7 @@ def readable_name(session, limit=28, branch=""):
 ICON = "C■"  # stands in for the Coder logo: these workspaces mirror a Coder one
 
 
-def session_tokens(session, branch="", conf=None):
+def session_tokens(session, branch="", conf=None, icon=ICON):
     """What this plugin puts in the sidebar: `{token name: value}`, "" to clear.
 
     Three tokens rather than one string, so the user's `ui.sidebar.spaces.rows`
@@ -283,7 +283,7 @@ def session_tokens(session, branch="", conf=None):
     names = token_names(conf)
     head = readable_name(session, branch=branch)
     return {
-        names["icon"]: ICON,
+        names["icon"]: icon,
         # Nothing better to say than the name itself: cleared, so the row does not
         # show the session name twice.
         names["ticket"]: "" if head == session["name"] else head,
@@ -1216,6 +1216,148 @@ def promote(name, pane):
     return workspace
 
 
+ICON_TAKEN = "L■"  # was mirroring a Coder session; now worked on locally
+
+# The local agent is started with one instruction: read the handover first. Both
+# CLIs take a bare prompt as their first argument, so there is nothing to branch
+# on beyond the binary's name.
+LAUNCH = {
+    "claude": f"claude {shlex.quote('Read ./' + TAKEOVER_FILE + ' before anything else: it is the handover from the remote Coder session you are continuing.')}",
+    "codex": f"codex {shlex.quote('Read ./' + TAKEOVER_FILE + ' before anything else: it is the handover from the remote Coder session you are continuing.')}",
+}
+
+
+# What people write in a config file versus what the binary is called. The
+# products are "Claude Code" and "Codex"; the commands are `claude` and `codex`.
+# Both spellings turn up, and a typo here would otherwise surface as a KeyError
+# traceback in the middle of a takeover.
+AGENT_ALIASES = {"claude-code": "claude", "claudecode": "claude",
+                 "codex-cli": "codex", "openai-codex": "codex"}
+
+
+def local_agent(conf, kind):
+    """Which agent takes over: the configured pick, or the remote's own type."""
+    want = str(conf.get("takeover_agent") or "match").strip().lower()
+    want = kind if want == "match" else AGENT_ALIASES.get(want, want)
+    if want not in LAUNCH:
+        sys.exit(f"takeover_agent={conf.get('takeover_agent')!r} is not an agent this "
+                 f'knows how to start -- use "match", {", ".join(sorted(LAUNCH))} '
+                 f"in {config_hint()}")
+    return want
+
+
+def exclude_locally(checkout, entry):
+    """Keep `entry` out of `git status` without touching the repository's .gitignore.
+
+    `.git/info/exclude` is the per-clone ignore file: it is not tracked, so a
+    handover never shows up in a diff and never reaches a PR. Worktrees share the
+    common dir, so one line covers every session of the same clone.
+    """
+    common = run(["git", "-C", checkout, "rev-parse", "--git-common-dir"]).strip()
+    if not os.path.isabs(common):
+        common = os.path.join(checkout, common)
+    path = os.path.join(common, "info", "exclude")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path) as handle:
+            if any(line.strip() == entry for line in handle):
+                return
+    except OSError:
+        pass  # no exclude file yet is the normal case, not a failure
+    with open(path, "a") as handle:
+        handle.write(f"\n# herdr-coder-sessions: local takeover handover\n{entry}\n")
+
+
+def demote_mirror(checkout, branch):
+    """Stop this worktree being a mirror, permanently.
+
+    Two pieces of bookkeeping say a worktree is derived: the marker inside its git
+    dir, which `--mirror` checks before it resets anything, and the ref recording
+    where this plugin last put the branch. Both go. After this a stray idle hook
+    firing `--mirror` hits the existing "not a mirror" guard and declines, which is
+    exactly the protection a worktree you author in should have.
+
+    Not a tear-down and rebuild: the session's *uncommitted* work lives only in
+    this working tree, and removing the worktree would throw it away to arrive at
+    the same branch and the same files.
+    """
+    marker = mirror_marker(checkout)
+    if os.path.exists(marker):
+        os.remove(marker)
+    common = run(["git", "-C", checkout, "rev-parse", "--git-common-dir"]).strip()
+    if not os.path.isabs(common):
+        common = os.path.join(checkout, common)
+    run(["git", "--git-dir", common, "update-ref", "-d", f"{MIRROR_REFS}/{branch}"],
+        check=False)
+
+
+def takeover(name):
+    """Move a session from mirrored-remote to worked-on-locally, once and for good.
+
+    The mirror is refreshed one last time so the worktree holds everything the
+    remote agent did, then demoted so nothing can ever reset it again. The remote
+    workspace is deliberately left running: pausing a task stops its workspace,
+    which is the ssh the local agent needs when the handover's missing tool output
+    turns out to matter.
+    """
+    conf = settings()
+    host = f"{name}{conf['host_suffix']}"
+    session = session_named(name)
+    if not session:
+        sys.exit(f"{name}: not a running Coder session -- ctrl-r in the picker")
+
+    kind = remote_agent(host)
+    if kind not in LAUNCH:
+        sys.exit(f"could not tell which agent runs on {host} "
+                 f"(agentapi reported {kind or 'nothing'}) -- taking over needs to "
+                 f"know which history to read")
+    # Resolved before anything is moved: a misspelt takeover_agent should stop the
+    # takeover, not surface once the mirror is already demoted and unrecoverable.
+    chosen = local_agent(conf, kind)
+
+    repo, branch, slug, shallow = remote_repo(host)
+    path = history_path(host, kind, repo, branch) if repo else ""
+    if not path:
+        sys.exit(f"no {kind} history for {name} on {host} -- nothing to hand over")
+
+    workspace, checkout, made = mirror_session(name, conf, focus=True)
+    if not checkout:
+        return None  # mirror_session has already said why
+
+    render = render_codex if kind == "codex" else render_claude
+    turns = render(history_text(host, path))
+    body = transcript(turns, name=name, host=host, kind=kind, checkout=checkout,
+                      branch=checkout_branch(checkout) or branch, repo=repo)
+    with open(os.path.join(checkout, TAKEOVER_FILE), "w") as handle:
+        handle.write(body)
+    exclude_locally(checkout, TAKEOVER_FILE)
+    demote_mirror(checkout, checkout_branch(checkout) or branch)
+
+    # Split first, close agentty last. Closing first would leave the agent's slot
+    # to whatever herdr collapses into it -- on a mirrored session that is reviewr,
+    # and `herdr pane run` sends text plus Enter, so the launch line would be typed
+    # into reviewr's TUI. Splitting from the agent's own pane also means the
+    # workspace can never empty mid-move, which is what promote()'s last-pane guard
+    # exists to prevent; here there is nothing to guard.
+    agent_pane = session_pane(workspace)
+    if not agent_pane:
+        sys.exit(f"no agentty pane in {workspace} -- nothing to take over")
+    # --cwd is not optional: agentty's pane sits wherever herdr opened it, and an
+    # agent started anywhere but the worktree reads the handover's paths against
+    # the wrong tree.
+    local = herdr("pane", "split", agent_pane, "--direction", "right",
+                  "--cwd", checkout)["result"]["pane"]["pane_id"]
+    herdr("pane", "run", local, LAUNCH[chosen])
+    herdr("pane", "close", agent_pane)
+
+    report_tokens(workspace, session_tokens(session, checkout_branch(checkout), conf,
+                                            icon=ICON_TAKEN), conf)
+    herdr("workspace", "focus", workspace)
+    note(f"{name} taken over locally: {len(turns)} turns in {checkout}/{TAKEOVER_FILE}, "
+         f"{chosen} running in {local}; the mirror is gone and {host} is left running")
+    return workspace
+
+
 def asked_before(name, branch):
     """Has this branch already been offered for this session? Records as it asks.
 
@@ -1516,6 +1658,16 @@ def selftest():
     assert claude_dir("/home/coder/content_backend/backend") == \
         "-home-coder-content-backend-backend"
     assert claude_dir("/Users/me/.config/x") == "-Users-me--config-x"
+
+    assert local_agent({"takeover_agent": "match"}, "codex") == "codex"
+    assert local_agent({"takeover_agent": "match"}, "claude") == "claude"
+    assert local_agent({"takeover_agent": "claude"}, "codex") == "claude"
+    assert local_agent({}, "codex") == "codex"  # absent key behaves as "match"
+    # The product's name, not the binary's, is what people write in a config file.
+    assert local_agent({"takeover_agent": "Claude-Code"}, "codex") == "claude"
+    assert local_agent({"takeover_agent": "codex-cli"}, "claude") == "codex"
+    assert set(LAUNCH) == {"claude", "codex"}
+    assert TAKEOVER_FILE in LAUNCH["claude"] and TAKEOVER_FILE in LAUNCH["codex"]
 
     print("selftest ok")
 
