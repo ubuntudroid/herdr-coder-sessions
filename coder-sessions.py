@@ -395,9 +395,10 @@ AGENT_TYPE = re.compile(r"agentapi\s+server\b[^\n]*?--type\s+(\S+)")
 
 # Picks the session's own codex rollout. Subagent threads live in the same tree
 # and carry the parent's session_id, so `thread_source` is the discriminator;
-# `cwd` keeps a second checkout on the same box out of it. Run on the workspace
-# because that is where the files are, and because shipping 19 candidates back
-# to choose between them would be absurd.
+# `cwd` keeps a second checkout on the same box out of it. The agent runs in the
+# repo root or a subdirectory, so match on prefix of the cwd argument (git root
+# from remote_repo). Run on the workspace because that is where the files are, and
+# because shipping 19 candidates back to choose between them would be absurd.
 CODEX_PICK = """
 import json, glob, os, sys
 best = ("", 0.0)
@@ -407,7 +408,9 @@ for path in glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/*.jsonl")):
             meta = json.loads(handle.readline()).get("payload") or {}
     except (OSError, ValueError):
         continue
-    if meta.get("thread_source") != "user" or meta.get("cwd") != sys.argv[1]:
+    cwd = meta.get("cwd") or ""
+    if meta.get("thread_source") != "user" or not (
+            cwd == sys.argv[1] or cwd.startswith(sys.argv[1] + "/")):
         continue
     stamp = os.path.getmtime(path)
     if stamp > best[1]:
@@ -416,24 +419,34 @@ print(best[0])
 """
 
 # Claude Code files one transcript per session under an encoded copy of the cwd,
-# so the directory is known and only the file is in question. The branch is what
-# tells the session's transcript from an earlier one in the same checkout; mtime
-# breaks a tie, and stands alone on a session that never branched.
+# so the directory is known and only the file is in question. The agent runs in the
+# repo root or a subdirectory, so glob the encoded root with a prefix and reject
+# non-boundary extensions (a dash means it is a subdirectory, anything else means
+# it is a different checkout like "content-backend2" against "content-backend").
+# The branch is what tells the session's transcript from an earlier one in the same
+# checkout; mtime breaks a tie, and stands alone on a session that never branched.
 CLAUDE_PICK = """
 import json, glob, os, sys
 best, fallback = ("", 0.0), ("", 0.0)
-for path in glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"),
-                                   sys.argv[1], "*.jsonl")):
-    stamp = os.path.getmtime(path)
-    if stamp > fallback[1]:
-        fallback = (path, stamp)
-    try:
-        with open(path) as handle:
-            branches = {json.loads(line).get("gitBranch") for line in handle}
-    except (OSError, ValueError):
+root = os.path.expanduser("~/.claude/projects")
+for folder in sorted(glob.glob(os.path.join(root, sys.argv[1] + "*"))):
+    # The encoding maps "/" to "-", so a directory for a path *inside* the repo
+    # extends the root's encoding at a dash. Anything else -- "content-backend2"
+    # against "content-backend" -- is a different checkout, not a subdirectory.
+    tail = os.path.basename(folder)[len(sys.argv[1]):]
+    if tail and not tail.startswith("-"):
         continue
-    if sys.argv[2] in branches and stamp > best[1]:
-        best = (path, stamp)
+    for path in glob.glob(os.path.join(folder, "*.jsonl")):
+        stamp = os.path.getmtime(path)
+        if stamp > fallback[1]:
+            fallback = (path, stamp)
+        try:
+            with open(path) as handle:
+                branches = {json.loads(line).get("gitBranch") for line in handle}
+        except (OSError, ValueError):
+            continue
+        if sys.argv[2] in branches and stamp > best[1]:
+            best = (path, stamp)
 print(best[0] or fallback[0])
 """
 
@@ -453,12 +466,7 @@ def remote_agent(host):
 def history_path(host, kind, repo, branch):
     """Where this session's own history file sits on the workspace, or ""."""
     if kind == "codex":
-        # Get the actual working directory of the agentapi process to match against
-        # stored session cwds in the history files. The agent may run in a subdirectory
-        # of the repo, so we need the actual pwd, not just the git root.
-        cwd_cmd = "python3 << 'GETCWD'\nimport subprocess, os\npids = subprocess.run(['pgrep', '-f', 'agentapi server'], capture_output=True, text=True).stdout.strip().split()\npid = pids[0] if pids else None\ntry:\n    print(os.readlink(f'/proc/{pid}/cwd') if pid else '', end='')\nexcept:\n    print('', end='')\nGETCWD"
-        actual_cwd = ssh_out(host, cwd_cmd, check=False).strip()
-        script, args = CODEX_PICK, [actual_cwd or repo]
+        script, args = CODEX_PICK, [repo]
     elif kind == "claude":
         script, args = CLAUDE_PICK, [claude_dir(repo), branch]
     else:
