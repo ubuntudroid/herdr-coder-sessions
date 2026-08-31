@@ -48,3 +48,13 @@ id = "web"
 title = "Coder sessions: open this session in the web UI"
 contexts = ["workspace", "tab", "pane"]
 command = ["python3", "coder-sessions.py", "--web"]
+
+# Take the focused session over locally: render its remote conversation into the
+# worktree, drop the mirror, and start a local agent there. The Coder workspace is
+# left running on purpose -- the local agent may need to ssh in for a tool output
+# the handover does not carry, and pausing a task stops its workspace.
+[[actions]]
+id = "takeover"
+title = "Coder sessions: take over locally"
+contexts = ["workspace", "tab", "pane"]
+command = ["python3", "coder-sessions.py", "--takeover"]

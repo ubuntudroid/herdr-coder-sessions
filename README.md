@@ -67,6 +67,12 @@ key = "prefix+ctrl+w"
 type = "plugin_action"
 command = "ubuntudroid.coder-sessions.web"
 description = "open this Coder session in the web UI"
+
+[[keys.command]]
+key = "prefix+ctrl+t"
+type = "plugin_action"
+command = "ubuntudroid.coder-sessions.takeover"
+description = "take this Coder session over locally"
 ```
 
 The second key refreshes the focused session's mirror, and in a workspace that has
@@ -92,6 +98,7 @@ The script also works standalone:
 ./coder-sessions.py --list         # rows only
 ./coder-sessions.py --open <name>  # open or focus one session
 ./coder-sessions.py --web [<name>] # open a session in the Coder web UI
+./coder-sessions.py --takeover <name> # hand it to a local agent, stop mirroring
 ./coder-sessions.py --restamp      # re-publish the sidebar tokens on open workspaces
 ./coder-sessions.py --selftest     # check the naming helpers
 ```
@@ -226,6 +233,35 @@ can hold several session branches and `HEAD` is unambiguous; and `git add -N` is
 capture untracked files, because it writes to the live agent's index and would show up in its
 own `git status`.
 
+## Take over locally
+
+`prefix+ctrl+t` (the `takeover` action) ends the remote flow for the focused
+session and continues it here. It refreshes the mirror one last time, renders the
+remote agent's conversation into `.coder-takeover.md` at the worktree root, drops
+the mirror marker so nothing can reset the worktree again, closes the agentty
+pane, and starts a local agent on the same branch.
+
+The handover is markdown, not the agent's own session format. That is deliberate:
+resuming a real session natively cost **1,032,229 tokens** on a 3.3 MB codex
+rollout and compacted itself mid-run, because 97% of that file is tool output,
+reasoning traces and world state replayed in full. The conversation alone is
+~22,000 tokens. Rendering is ~70× cheaper, works between agents — a codex session
+can be picked up by Claude Code — and does not break when either CLI changes its
+on-disk format. What it drops is the tool *output*; the commands are still listed,
+and the worktree already holds everything they produced.
+
+`takeover_agent` decides who picks it up: `"match"` (the default) uses whichever
+agent agentapi ran on the workspace, and a name always uses that one.
+
+The Coder workspace is **not** paused. A paused task is a stopped workspace, so
+pausing would remove the `ssh <session>.coder` the local agent is told to fall back
+on when it needs something that genuinely cannot be reproduced here. Nothing is
+lost by leaving it: a Coder agent only acts when it is sent input, and ssh restarts
+a stopped workspace on demand in about 30 seconds.
+
+Taking over is one-way. The worktree is yours afterwards — `prefix+ctrl+m` on it
+declines, the same way it declines on any worktree this plugin did not derive.
+
 ## The web UI
 
 `prefix+ctrl+w` opens the focused session's page in the Coder web UI, and `ctrl-o`
@@ -331,6 +367,7 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
 | `host_suffix` | `".coder"` | appended to the session name to form the ssh host |
 | `clone_root` | `"~/projects/github"` | where `<owner>/<repo>` clones live |
 | `mirror` | `true` | mirror the session into a local worktree on open |
+| `takeover_agent` | `"match"` | which agent [takes a session over locally](#take-over-locally): `"match"` uses whichever agent ran on the workspace, `"claude"` or `"codex"` always uses that one |
 | `tokens` | `{"icon": "coder_icon", "ticket": "coder_ticket", "name": "coder"}` | [sidebar token](#sidebar-tokens) names. Merged with the defaults, so renaming one keeps the others; `""` stops that one being published |
 
 ## Notes

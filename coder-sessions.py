@@ -16,6 +16,8 @@ that is already open focuses its workspace instead of building a second one.
     coder-sessions.py --web [NAME]     open a session in the Coder web UI: the one
                                        named, else the focused workspace's
     coder-sessions.py --promote        the pane that asks before moving a session
+    coder-sessions.py --takeover NAME  hand this session's conversation to a local
+                                       agent and stop mirroring it
     coder-sessions.py --restamp        re-publish the sidebar tokens on open workspaces
     coder-sessions.py --selftest       check the naming helpers
 
@@ -68,6 +70,10 @@ DEFAULTS = {
     "host_suffix": ".coder",  # ssh host is <session name> + this
     "clone_root": "~/projects/github",  # <clone_root>/<owner>/<repo>, as gh-dash maps it
     "mirror": True,        # mirror the session into a local worktree when we can
+    # Which agent picks a session up locally. "match" uses whatever agentapi ran
+    # on the workspace; a name ("claude", "codex") always uses that one, since the
+    # handover is plain markdown and any agent can read any other's.
+    "takeover_agent": "match",
     # Sidebar metadata token names, rendered by `ui.sidebar.spaces.rows` as `$name`.
     # Renameable because the token namespace is global: `--source` scopes the seq
     # counter only, so two plugins publishing the same name overwrite each other,
@@ -1467,20 +1473,30 @@ def pick(sessions):
     return proc.stdout.split("\t", 1)[0].strip()
 
 
+def focused_session(workspace=None):
+    """`(workspace id, session name)` for the workspace an action fired in.
+
+    The name comes from the token this plugin stamps, which is why a keybinding
+    needs no argument. A helper rather than two copies, so --refresh and --takeover
+    fail with the same sentence in the same situation.
+    """
+    workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
+    if not workspace:
+        sys.exit("no workspace in focus (HERDR_WORKSPACE_ID unset)")
+    token = name_token()
+    name = (workspace_info(workspace).get("tokens") or {}).get(token)
+    if not name:
+        sys.exit(f"{workspace} is not a Coder session workspace (no {token} token)")
+    return workspace, name
+
+
 def refresh(workspace=None):
     """Refresh the mirror behind a workspace -- the plugin action's job.
 
     Takes the workspace from the action's environment, so a keybinding needs no
     argument, and reads the session name from the token this plugin stamps.
     """
-    workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
-    if not workspace:
-        sys.exit("no workspace to refresh (HERDR_WORKSPACE_ID unset)")
-    token = name_token()
-    name = (workspace_info(workspace).get("tokens") or {}).get(token)
-    if not name:
-        sys.exit(f"{workspace} is not a Coder session workspace "
-                 f"(no {token} token) -- nothing to refresh")
+    workspace, name = focused_session(workspace)
     if mirror_workspace(workspace):
         return mirror_session(name, settings())
     # No mirror to refresh: this workspace was opened while the session sat on the
@@ -1704,6 +1720,9 @@ def main():
                              "mirror, or offer one now that it is possible")
     parser.add_argument("--promote", action="store_true",
                         help="the pane that asks before moving a session into a mirror")
+    parser.add_argument("--takeover", nargs="?", const="", metavar="NAME",
+                        help="hand a session's conversation to a local agent and "
+                             "drop its mirror; without NAME, the focused workspace's")
     parser.add_argument("--restamp", action="store_true",
                         help="re-publish the sidebar tokens on open Coder workspaces")
     parser.add_argument("--pane", action="store_true",
@@ -1727,6 +1746,9 @@ def main():
 
     if args.promote:
         return promote_pane()
+
+    if args.takeover is not None:
+        return takeover(args.takeover or focused_session()[1])
 
     if args.restamp:
         return restamp()
