@@ -1246,6 +1246,17 @@ def local_agent(conf, kind):
     return want
 
 
+def git_common_dir(checkout):
+    """The clone's shared git dir, absolute.
+
+    Where a worktree's refs and the per-clone ignore file live. `rev-parse`
+    answers relative to the worktree it was asked in, so the join is what makes
+    the answer usable from a caller that is not standing there.
+    """
+    common = run(["git", "-C", checkout, "rev-parse", "--git-common-dir"]).strip()
+    return common if os.path.isabs(common) else os.path.join(checkout, common)
+
+
 def exclude_locally(checkout, entry):
     """Keep `entry` out of `git status` without touching the repository's .gitignore.
 
@@ -1253,10 +1264,7 @@ def exclude_locally(checkout, entry):
     handover never shows up in a diff and never reaches a PR. Worktrees share the
     common dir, so one line covers every session of the same clone.
     """
-    common = run(["git", "-C", checkout, "rev-parse", "--git-common-dir"]).strip()
-    if not os.path.isabs(common):
-        common = os.path.join(checkout, common)
-    path = os.path.join(common, "info", "exclude")
+    path = os.path.join(git_common_dir(checkout), "info", "exclude")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         with open(path) as handle:
@@ -1284,11 +1292,8 @@ def demote_mirror(checkout, branch):
     marker = mirror_marker(checkout)
     if os.path.exists(marker):
         os.remove(marker)
-    common = run(["git", "-C", checkout, "rev-parse", "--git-common-dir"]).strip()
-    if not os.path.isabs(common):
-        common = os.path.join(checkout, common)
-    run(["git", "--git-dir", common, "update-ref", "-d", f"{MIRROR_REFS}/{branch}"],
-        check=False)
+    run(["git", "--git-dir", git_common_dir(checkout), "update-ref", "-d",
+         f"{MIRROR_REFS}/{branch}"], check=False)
 
 
 def takeover(name):
@@ -1324,14 +1329,24 @@ def takeover(name):
     if not checkout:
         return None  # mirror_session has already said why
 
+    # Read before anything is written or demoted. This is a cheap list call and
+    # everything below it survives a failure only as a half-finished takeover:
+    # the marker is gone, the handover is on disk, and re-running cannot put
+    # either back. refresh() guards the same failure the same way before promote().
+    agent_pane = session_pane(workspace)
+    if not agent_pane:
+        sys.exit(f"no agentty pane in {workspace} -- nothing to take over")
+
+    branch = checkout_branch(checkout) or branch
+
     render = render_codex if kind == "codex" else render_claude
     turns = render(history_text(host, path))
     body = transcript(turns, name=name, host=host, kind=kind, checkout=checkout,
-                      branch=checkout_branch(checkout) or branch, repo=repo)
+                      branch=branch, repo=repo)
     with open(os.path.join(checkout, TAKEOVER_FILE), "w") as handle:
         handle.write(body)
     exclude_locally(checkout, TAKEOVER_FILE)
-    demote_mirror(checkout, checkout_branch(checkout) or branch)
+    demote_mirror(checkout, branch)
 
     # Split first, close agentty last. Closing first would leave the agent's slot
     # to whatever herdr collapses into it -- on a mirrored session that is reviewr,
@@ -1339,9 +1354,6 @@ def takeover(name):
     # into reviewr's TUI. Splitting from the agent's own pane also means the
     # workspace can never empty mid-move, which is what promote()'s last-pane guard
     # exists to prevent; here there is nothing to guard.
-    agent_pane = session_pane(workspace)
-    if not agent_pane:
-        sys.exit(f"no agentty pane in {workspace} -- nothing to take over")
     # --cwd is not optional: agentty's pane sits wherever herdr opened it, and an
     # agent started anywhere but the worktree reads the handover's paths against
     # the wrong tree.
@@ -1350,7 +1362,7 @@ def takeover(name):
     herdr("pane", "run", local, LAUNCH[chosen])
     herdr("pane", "close", agent_pane)
 
-    report_tokens(workspace, session_tokens(session, checkout_branch(checkout), conf,
+    report_tokens(workspace, session_tokens(session, branch, conf,
                                             icon=ICON_TAKEN), conf)
     herdr("workspace", "focus", workspace)
     note(f"{name} taken over locally: {len(turns)} turns in {checkout}/{TAKEOVER_FILE}, "
@@ -1603,6 +1615,7 @@ def selftest():
     assert set(session_tokens(sess(), conf=partial)) \
         == {default["icon"], "mine", default["name"]}
     assert merge_settings({"mirror": False})["tokens"] == default
+    assert session_tokens(sess(), icon=ICON_TAKEN)[default["icon"]] == ICON_TAKEN
 
     # Take over locally: the renderers, on one line of each shape that matters.
     codex_lines = "\n".join(json.dumps(entry) for entry in [
