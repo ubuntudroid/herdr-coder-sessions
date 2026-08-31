@@ -1522,8 +1522,20 @@ def refresh(workspace=None):
     argument, and reads the session name from the token this plugin stamps.
     """
     workspace, name = focused_session(workspace)
+    conf = settings()
     if mirror_workspace(workspace):
-        return mirror_session(name, settings())
+        return mirror_session(name, conf)
+    # Taken over: the worktree is the user's now, the marker is gone, and there is
+    # no agentty left to promote. Worth its own sentence, because the generic
+    # "no agentty pane" below names the symptom and leaves the cause to be guessed
+    # at -- and here the absence is the feature working, not something broken.
+    # The icon token rather than the worktree: it is what takeover() stamps and
+    # restamp() preserves, and a herdr restart that drops it also drops the name
+    # token, so focused_session() has already refused by then.
+    if (workspace_info(workspace).get("tokens") or {}).get(token_names(conf)["icon"]) \
+            == ICON_TAKEN:
+        sys.exit(f"{name} was taken over locally -- its worktree is yours now and "
+                 f"nothing resets it, so there is no mirror left to refresh")
     # No mirror to refresh: this workspace was opened while the session sat on the
     # clone's own branch. Moving it into a mirror is the useful thing the key can
     # do instead, and the keypress is the consent the idle hook has to ask for.

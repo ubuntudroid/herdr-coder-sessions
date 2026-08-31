@@ -261,10 +261,10 @@ on when it needs something that genuinely cannot be reproduced here. Nothing is
 lost by leaving it: a Coder agent only acts when it is sent input, and ssh restarts
 a stopped workspace on demand in about 30 seconds.
 
-Taking over is one-way. The worktree is yours afterwards — `prefix+ctrl+m` on it
-still declines, though by a different route: agentty is gone with the takeover,
-so `refresh` exits at "nothing to refresh or promote" rather than ever reaching
-`mirror_session`'s not-a-mirror guard.
+Taking over is one-way. The worktree is yours afterwards, and `prefix+ctrl+m` on
+it says so rather than refusing generically: it recognises the taken-over icon and
+answers that there is no mirror left to refresh. It never reaches
+`mirror_session`'s not-a-mirror guard, because agentty went with the takeover.
 
 ## The web UI
 
