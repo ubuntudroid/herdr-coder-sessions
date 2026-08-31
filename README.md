@@ -77,7 +77,9 @@ description = "take this Coder session over locally"
 
 The second key refreshes the focused session's mirror, and in a workspace that has
 none yet it moves the session into one — see [Mirroring](#mirroring). The third opens
-the focused session's page in the Coder web UI — see [The web UI](#the-web-ui).
+the focused session's page in the Coder web UI — see [The web UI](#the-web-ui). The
+fourth ends the remote flow and continues it locally — see
+[Take over locally](#take-over-locally).
 
 Or, without installing the plugin, point a popup straight at the script:
 
@@ -245,7 +247,7 @@ The handover is markdown, not the agent's own session format. That is deliberate
 resuming a real session natively cost **1,032,229 tokens** on a 3.3 MB codex
 rollout and compacted itself mid-run, because 97% of that file is tool output,
 reasoning traces and world state replayed in full. The conversation alone is
-~22,000 tokens. Rendering is ~70× cheaper, works between agents — a codex session
+~14,000 tokens. Rendering is ~70× cheaper, works between agents — a codex session
 can be picked up by Claude Code — and does not break when either CLI changes its
 on-disk format. What it drops is the tool *output*; the commands are still listed,
 and the worktree already holds everything they produced.

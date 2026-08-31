@@ -32,6 +32,7 @@ a plugin cannot add it for you.
 Settings, all optional, in $HERDR_PLUGIN_CONFIG_DIR/config.json:
 
     {"host_suffix": ".coder", "clone_root": "~/projects/github", "mirror": true,
+     "takeover_agent": "match",
      "tokens": {"icon": "coder_icon", "ticket": "coder_ticket", "name": "coder"}}
 """
 
