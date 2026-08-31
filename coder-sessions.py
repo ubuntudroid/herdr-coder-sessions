@@ -16,8 +16,8 @@ that is already open focuses its workspace instead of building a second one.
     coder-sessions.py --web [NAME]     open a session in the Coder web UI: the one
                                        named, else the focused workspace's
     coder-sessions.py --promote        the pane that asks before moving a session
-    coder-sessions.py --takeover NAME  hand this session's conversation to a local
-                                       agent and stop mirroring it
+    coder-sessions.py --takeover [NAME] hand this session's conversation to a local
+                                        agent and stop mirroring it
     coder-sessions.py --restamp        re-publish the sidebar tokens on open workspaces
     coder-sessions.py --selftest       check the naming helpers
 
@@ -465,7 +465,12 @@ def claude_dir(path):
 
 def remote_agent(host):
     """Which agent agentapi started on the session -- "codex", "claude" -- or ""."""
-    line = ssh_out(host, "ps -eo args= | grep -m1 'agentapi server'", check=False)
+    # "[a]gentapi": grep's own argv contains the literal pattern too, so a plain
+    # 'agentapi server' can match grep itself under `ps` -- and with -m1, does,
+    # whenever that line sorts first, silently returning no --type. The bracket
+    # is invisible to the process being searched for but breaks grep's argv out
+    # of matching its own pattern.
+    line = ssh_out(host, "ps -eo args= | grep -m1 '[a]gentapi server'", check=False)
     found = AGENT_TYPE.search(line or "")
     return found.group(1) if found else ""
 
@@ -1314,9 +1319,19 @@ def takeover(name):
     """
     conf = settings()
     host = f"{name}{conf['host_suffix']}"
+
+    # mirror_session() builds a worktree and a workspace from scratch for any
+    # session that does not have one yet -- right for opening a session, wrong
+    # here: a takeover ends an *existing* mirror, so a session whose agentty
+    # pane sits in a mirrorless workspace (the promote offer was declined, or
+    # never reached because the agent had not branched) has nothing to end.
+    # Checked first, off local herdr state only, before the ssh calls below --
+    # and before mirror_session can build the stray workspace this replaces.
+    existing = open_workspaces().get(name)
+    if not existing or not mirror_workspace(existing):
+        sys.exit(f"{name} has no mirror to take over -- prefix+ctrl+m moves it "
+                 f"into one first")
     session = session_named(name)
-    if not session:
-        sys.exit(f"{name}: not a running Coder session -- ctrl-r in the picker")
 
     kind = remote_agent(host)
     if kind not in LAUNCH:
@@ -1332,7 +1347,7 @@ def takeover(name):
     if not path:
         sys.exit(f"no {kind} history for {name} on {host} -- nothing to hand over")
 
-    workspace, checkout, made = mirror_session(name, conf, focus=True)
+    workspace, checkout, _ = mirror_session(name, conf, focus=True)
     if not checkout:
         return None  # mirror_session has already said why
 
@@ -1348,6 +1363,15 @@ def takeover(name):
 
     render = render_codex if kind == "codex" else render_claude
     turns = render(history_text(host, path))
+    if not turns:
+        # Guarding turns, not history_text: an empty string is not the only way
+        # to end up with nothing -- a renderer that no longer recognises the
+        # history file's schema returns [] on real content too, and that failure
+        # deserves the same stop. The mirror above was only refreshed, same as
+        # any other turn, so nothing here is demoted and agentty is still
+        # running: safe to run the takeover again.
+        sys.exit(f"no conversation came back from {name}'s {kind} history at "
+                 f"{host}:{path} -- nothing to hand over")
     body = transcript(turns, name=name, host=host, kind=kind, checkout=checkout,
                       branch=branch, repo=repo)
     with open(os.path.join(checkout, TAKEOVER_FILE), "w") as handle:
@@ -1554,7 +1578,8 @@ def restamp():
     conf = settings()
     known = {s["name"]: s for s in (describe(t) for t in running_sessions(False))}
     by_pane = pane_sessions()
-    token = name_token(conf)
+    names = token_names(conf)
+    token = names["name"]
     changes = 0
     for w in herdr("workspace", "list").get("result", {}).get("workspaces", []):
         workspace = w["workspace_id"]
@@ -1564,7 +1589,13 @@ def restamp():
         if not session:
             continue
         branch = checkout_branch((w.get("worktree") or {}).get("checkout_path"))
-        wanted = session_tokens(session, branch, conf)
+        # session_tokens() defaults to ICON, the mirror icon -- right for every
+        # workspace except one takeover() already stamped ICON_TAKEN on. That
+        # icon is the only sidebar signal telling a taken-over worktree apart
+        # from a live mirror, so read it the same way `name` above is read off
+        # the existing tokens, rather than always rebuilding the default.
+        icon = ICON_TAKEN if tokens.get(names["icon"]) == ICON_TAKEN else ICON
+        wanted = session_tokens(session, branch, conf, icon=icon)
         # "" means clear, and a token already absent is already cleared.
         if all(tokens.get(t, "") == v for t, v in wanted.items() if t):
             continue
@@ -1675,6 +1706,11 @@ def selftest():
     # file the remote agent may still be writing.
     assert render_codex("not json\n") == []
     assert render_claude("{broken\n") == []
+    # takeover()'s guard against an empty handover trusts this: an unreadable
+    # or transiently unreachable history file renders to [], same as no history
+    # at all, so checking `turns` catches both.
+    assert render_codex("") == []
+    assert render_claude("") == []
 
     body = transcript([("user", "go"), ("tool", "Bash: ls"), ("assistant", "done")],
                       name="task-1a2b", host="task-1a2b.coder", kind="codex",

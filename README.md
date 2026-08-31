@@ -100,7 +100,7 @@ The script also works standalone:
 ./coder-sessions.py --list         # rows only
 ./coder-sessions.py --open <name>  # open or focus one session
 ./coder-sessions.py --web [<name>] # open a session in the Coder web UI
-./coder-sessions.py --takeover <name> # hand it to a local agent, stop mirroring
+./coder-sessions.py --takeover [<name>] # hand it to a local agent, stop mirroring
 ./coder-sessions.py --restamp      # re-publish the sidebar tokens on open workspaces
 ./coder-sessions.py --selftest     # check the naming helpers
 ```
@@ -262,7 +262,9 @@ lost by leaving it: a Coder agent only acts when it is sent input, and ssh resta
 a stopped workspace on demand in about 30 seconds.
 
 Taking over is one-way. The worktree is yours afterwards — `prefix+ctrl+m` on it
-declines, the same way it declines on any worktree this plugin did not derive.
+still declines, though by a different route: agentty is gone with the takeover,
+so `refresh` exits at "nothing to refresh or promote" rather than ever reaching
+`mirror_session`'s not-a-mirror guard.
 
 ## The web UI
 
