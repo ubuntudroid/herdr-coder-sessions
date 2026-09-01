@@ -32,8 +32,7 @@ a plugin cannot add it for you.
 Settings, all optional, in $HERDR_PLUGIN_CONFIG_DIR/config.json:
 
     {"host_suffix": ".coder", "clone_root": "~/projects/github", "mirror": true,
-     "takeover_agent": "match",
-     "tokens": {"icon": "coder_icon", "ticket": "coder_ticket", "name": "coder"}}
+     "takeover_agent": "match", "token_prefix": "coder_"}
 """
 
 import argparse
@@ -75,16 +74,14 @@ DEFAULTS = {
     # on the workspace; a name ("claude", "codex") always uses that one, since the
     # handover is plain markdown and any agent can read any other's.
     "takeover_agent": "match",
-    # Sidebar metadata token names, rendered by `ui.sidebar.spaces.rows` as `$name`.
-    # Renameable because the token namespace is global: `--source` scopes the seq
-    # counter only, so two plugins publishing the same name overwrite each other,
-    # and either one clearing it takes the other's value with it. Set one to ""
-    # to stop publishing that token.
-    "tokens": {
-        "icon": "coder_icon",      # C■, marking the workspace as mirroring a Coder one
-        "ticket": "coder_ticket",  # the ticket the branch or task names, else a summary
-        "name": "coder",           # the Coder session name -- also this plugin's key
-    },
+    # Namespace for this plugin's sidebar metadata tokens: the prefix plus each
+    # name in TOKEN_SUFFIXES, rendered by `ui.sidebar.spaces.rows` as
+    # `$coder_icon` and so on. Prefixed because the token namespace is global --
+    # `--source` scopes the seq counter only, so two plugins publishing the same
+    # name overwrite each other, and either one clearing it takes the other's
+    # value with it. Change this if something else already claims these names,
+    # and mirror it in `rows`.
+    "token_prefix": "coder_",
 }
 
 DIM, BOLD, RESET = "\x1b[2m", "\x1b[1m", "\x1b[0m"
@@ -93,15 +90,8 @@ STATE_COLOR = {"idle": "\x1b[32m", "working": "\x1b[33m",
 
 
 def merge_settings(user):
-    """DEFAULTS overlaid with the user's config.json.
-
-    `tokens` is merged rather than replaced: renaming one token should not
-    silently drop the other two, which the flat update the rest of the settings
-    get would do.
-    """
-    merged = dict(DEFAULTS, **user)
-    merged["tokens"] = dict(DEFAULTS["tokens"], **(user.get("tokens") or {}))
-    return merged
+    """DEFAULTS overlaid with the user's config.json."""
+    return dict(DEFAULTS, **user)
 
 
 def settings():
@@ -222,9 +212,17 @@ METADATA_SOURCE = "coder-sessions"
 REVIEWR = "persiyanov.reviewr"  # the review pane this plugin opens beside the agent
 
 
+# What each token carries, under `token_prefix`:
+#   icon    C■, marking the workspace as mirroring a Coder one
+#   ticket  the ticket the branch or task names, else a summary
+#   name    the Coder session name -- also this plugin's key on a workspace
+TOKEN_SUFFIXES = ("icon", "ticket", "name")
+
+
 def token_names(conf=None):
-    """The configured token names, defaults filled in."""
-    return (conf or settings())["tokens"]
+    """This plugin's token names, keyed by suffix: `{"icon": "coder_icon", ...}`."""
+    prefix = (conf or settings())["token_prefix"]
+    return {suffix: prefix + suffix for suffix in TOKEN_SUFFIXES}
 
 
 def name_token(conf=None):
@@ -308,8 +306,6 @@ def report_tokens(workspace, values, conf=None):
     """
     args = []
     for token, value in values.items():
-        if not token:
-            continue  # the user turned this one off
         args += ["--clear-token", token] if value == "" else ["--token", f"{token}={value}"]
     if args:
         herdr("workspace", "report-metadata", workspace, "--source", METADATA_SOURCE, *args)
@@ -1659,7 +1655,7 @@ def selftest():
                     "https://coder.example.com/") \
         == "https://coder.example.com/tasks/someone/62a38be6-ebc1"
 
-    default = DEFAULTS["tokens"]
+    default = token_names(DEFAULTS)
     assert session_tokens(sess(display_name="tackle PROJ-42")) == {
         default["icon"]: "C■",
         default["ticket"]: "PROJ-42",
@@ -1670,11 +1666,10 @@ def selftest():
     # Nothing better to say than the name: the ticket token is cleared, not
     # left showing the session name a second time.
     assert session_tokens(sess())[default["ticket"]] == ""
-    # A partial override renames one token and keeps the other two.
-    partial = merge_settings({"tokens": {"ticket": "mine"}})
-    assert set(session_tokens(sess(), conf=partial)) \
-        == {default["icon"], "mine", default["name"]}
-    assert merge_settings({"mirror": False})["tokens"] == default
+    # One prefix names every token, so an override moves all three together.
+    assert set(default) == {"icon", "ticket", "name"} and default["name"] == "coder_name"
+    renamed = merge_settings({"token_prefix": "cs_"})
+    assert set(session_tokens(sess(), conf=renamed)) == {"cs_icon", "cs_ticket", "cs_name"}
     assert session_tokens(sess(), icon=ICON_TAKEN)[default["icon"]] == ICON_TAKEN
 
     # Take over locally: the renderers, on one line of each shape that matters.

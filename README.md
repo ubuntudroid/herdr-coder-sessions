@@ -115,7 +115,7 @@ writes to, so they fight over it. It publishes **metadata tokens** instead, whic
 |---|---|---|
 | `$coder_icon` | `C■` | marks the workspace as mirroring a Coder one |
 | `$coder_ticket` | `PROJ-1234` | the ticket the branch names, else the one the task names, else the display name with Slack markup stripped, truncated. Cleared when there is nothing to say beyond the session name |
-| `$coder` | `example-task-4f21` | the Coder session name — also the plugin's own handle on the workspace |
+| `$coder_name` | `example-task-4f21` | the Coder session name — also the plugin's own handle on the workspace |
 
 **A plugin cannot add these to your config.** Put them in `~/.config/herdr/config.toml`
 yourself, wherever you want them, and run `herdr server reload-config`:
@@ -126,7 +126,7 @@ rows = [
   ["state_icon", "workspace"],
   ["branch", "git_status"],
   [{ token = "$coder_icon" }, { token = "$coder_ticket", bold = true }],
-  ["$coder"],
+  ["$coder_name"],
 ]
 ```
 
@@ -138,13 +138,14 @@ previous UI settings, so a bad value costs a reload, not your sidebar). Omitting
 
 Without a label of its own, a session's workspace falls back to what herdr derives:
 the mirror's branch name, or `~` when there is no mirror. The session name appears
-nowhere but `$coder`.
+nowhere but `$coder_name`.
 
 Token names are a **global namespace** — `--source` scopes the sequence counter,
-not the name. Two plugins publishing `$coder` would overwrite each other, and
-either one clearing it would take the other's value with it. Rename any of the
-three in the plugin's own `config.json` if something else already claims it; set
-one to `""` to stop publishing it.
+not the name. Two plugins publishing `$coder_name` would overwrite each other, and
+either one clearing it would take the other's value with it. So every token this
+plugin publishes is prefixed `coder_`. Change the prefix in the plugin's own
+`config.json` (`token_prefix`) if something else already claims those names, and
+mirror it in `rows`; set it to `""` for bare `icon` / `ticket` / `name`.
 
 Tokens are display-only: a herdr restart drops them. The plugin re-stamps a
 workspace whenever the picker runs, recognising it by the session name herdr's
@@ -201,7 +202,7 @@ still there for whatever tool you prefer.
   generic — agentty knows nothing about this plugin.
 - **On demand**, with `prefix+ctrl+m` (the `refresh` action), which refreshes the focused
   workspace's mirror — or, in a workspace that has none yet, moves the session into one. It
-  reads the session name from the [`$coder` token](#sidebar-tokens), so it needs no argument,
+  reads the session name from the [`$coder_name` token](#sidebar-tokens), so it needs no argument,
   and refuses cleanly in a workspace that is not a session's. It resets the mirror hard, so it
   will not guess: after a herdr restart has dropped the tokens, open the picker once (or run
   `--restamp`) to put them back.
@@ -372,7 +373,7 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
 | `clone_root` | `"~/projects/github"` | where `<owner>/<repo>` clones live |
 | `mirror` | `true` | mirror the session into a local worktree on open |
 | `takeover_agent` | `"match"` | which agent [takes a session over locally](#take-over-locally): `"match"` uses whichever agent ran on the workspace, `"claude"` or `"codex"` always uses that one |
-| `tokens` | `{"icon": "coder_icon", "ticket": "coder_ticket", "name": "coder"}` | [sidebar token](#sidebar-tokens) names. Merged with the defaults, so renaming one keeps the others; `""` stops that one being published |
+| `token_prefix` | `"coder_"` | namespace for the [sidebar tokens](#sidebar-tokens): this prefix plus `icon` / `ticket` / `name`. Change it if another plugin already claims those names, and mirror it in `rows` |
 
 ## Notes
 
