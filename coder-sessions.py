@@ -561,10 +561,8 @@ def fetch_review_base(clone):
 def mirror_session(name, conf, focus=False):
     """Reproduce the session's checkout locally and return its herdr workspace.
 
-    Returns (workspace_id, checkout_path, made_the_worktree), or (None, None, False)
-    when the session cannot be mirrored -- the caller then falls back to a
-    plain workspace. The last flag says which herdr event the open fired, which is
-    what decides whether reviewr auto-opened (see open_reviewr).
+    Returns (workspace_id, checkout_path), or (None, None) when the session cannot
+    be mirrored -- the caller then falls back to a plain workspace.
 
     The mirror carries the session's commits *and* its uncommitted work, which is
     the state a review tool needs and no PR view can show. It is derived, never
@@ -580,13 +578,13 @@ def mirror_session(name, conf, focus=False):
     repo, branch, slug, shallow = remote_repo(host)
     if not repo or not branch:
         note(f"could not read {host}'s checkout over ssh -- opening without a mirror")
-        return None, None, False
+        return None, None
     clone = clone_path(slug, conf["clone_root"])
     if not clone:
         note(f"no local clone for {slug or 'the session repo'} under "
              f"{conf['clone_root']} -- opening without a mirror "
              f"(point clone_root at your clones in {config_hint()})")
-        return None, None, False
+        return None, None
     fetch_review_base(clone)  # before the base: a fresher origin also widens `connected`
 
     # A named local branch, not a detached ref: reviewr's PR tab resolves the PR
@@ -621,10 +619,9 @@ def mirror_session(name, conf, focus=False):
         note(f"could not mirror {name}: no commit of the session is in {clone} with "
              f"its history -- try `git -C {clone} fetch origin`"
              f"\n  {reason or 'nothing shared with the session'}")
-        return None, None, False
+        return None, None
 
     checkout = worktree_for(clone, branch)
-    made = not checkout
     if checkout:
         if not is_mirror(checkout):
             # Nearly always the clone's own checkout: a session that has not
@@ -635,7 +632,7 @@ def mirror_session(name, conf, focus=False):
                  f"(no {MIRROR_MARK} marker) -- {name} gets no mirror while it is "
                  f"on that branch; the turn the agent branches it is offered one, "
                  f"and prefix+ctrl+m moves it there")
-            return None, None, False
+            return None, None
         run(["git", "-C", checkout, "reset", "-q", "--hard", base])
         run(["git", "-C", checkout, "clean", "-qfd"])
         claim_branch(clone, branch, base)
@@ -678,7 +675,7 @@ def mirror_session(name, conf, focus=False):
 
     apply_session_changes(host, repo, checkout, base)
     note(f"mirrored {name} at {checkout} ({branch} @ {base[:12]}){source}")
-    return workspace, checkout, made
+    return workspace, checkout
 
 
 def worktree_for(clone, branch):
@@ -1062,63 +1059,6 @@ def pane_running(pane, program):
     return any(program in (proc.get("cmdline") or "") for proc in running)
 
 
-def reviewr_config():
-    """reviewr's own resolved settings, or None when it is not installed.
-
-    Its binary owns the TOML parsing and the defaults, so asking it beats reading
-    the config file here: placement, direction and auto_open all come back
-    normalized, and one contract serves reviewr's entry points and this one. The
-    paths are the stable symlinks reviewr keeps pointed at whatever hashed install
-    directory it lives under today.
-    """
-    for path in (os.path.expanduser(f"~/.local/state/herdr/plugins/{REVIEWR}/bin/herdr-reviewr"),
-                 os.path.expanduser("~/.local/bin/herdr-reviewr"),
-                 shutil.which("herdr-reviewr")):
-        if path and os.access(path, os.X_OK):
-            try:
-                return json.loads(run([path, "--resolve-plugin-config"], check=False))
-            except ValueError:
-                return None  # a validation error, which reviewr's own actions report
-    return None
-
-
-def open_reviewr(workspace, pane, checkout):
-    """Put reviewr beside the agent, because the event that would have will not fire.
-
-    reviewr auto-opens on `worktree.created`, which only the *first* mirror of a
-    branch fires: every open after that reuses the checkout and goes through
-    `worktree open`, whose `worktree.opened` reviewr does not subscribe to
-    (https://github.com/persiyanov/herdr-reviewr/issues/82). So the caller asks for
-    a pane on exactly the openings the event misses -- racing it on the others
-    would leave two -- and reviewr's own settings decide the rest.
-    """
-    conf = reviewr_config()
-    if not conf or not conf.get("auto_open", True):
-        return  # not installed, or the user turned auto-opening off
-    panes = herdr("pane", "list", "--workspace", workspace)["result"]["panes"]
-    if any(pane_running(p["pane_id"], "herdr-reviewr") for p in panes):
-        return  # a workspace herdr already had may carry one
-    placement = conf.get("toggle_placement", "split")
-    where = ["--target-pane", pane] if placement in ("split", "zoomed") else []
-    if placement == "split":
-        where += ["--direction", conf.get("toggle_direction", "right")]
-    elif placement == "tab":
-        where = ["--workspace", workspace]
-    # Not `herdr`: a review pane is a bonus, so a failure here reports and leaves
-    # the session open rather than aborting an open that has already landed.
-    out = run([HERDR, "plugin", "pane", "open", "--plugin", REVIEWR,
-               "--entrypoint", "pane", "--placement", placement, *where,
-               "--cwd", checkout, "--no-focus"], check=False)
-    try:
-        new = ((json.loads(out).get("result") or {}).get("plugin_pane") or {}).get("pane") or {}
-    except ValueError:
-        new = {}
-    if placement == "tab" and new.get("tab_id"):
-        # herdr labels a fresh tab with a bare index; reviewr names its own.
-        herdr("tab", "rename", new["tab_id"], "reviewr")
-    note(f"  reviewr: {new.get('pane_id') or 'failed to open'} ({placement})")
-
-
 def open_session(name, sessions=None):
     """Focus this session's workspace, building it the first time."""
     existing = open_workspaces(sessions).get(name)
@@ -1136,21 +1076,20 @@ def open_session(name, sessions=None):
     session = next(s for s in sessions if s["name"] == name)
 
     workspace = checkout = None
-    made = False
     if conf.get("mirror", True):
-        workspace, checkout, made = mirror_session(name, conf)
-    attach_session(name, session, conf, workspace, checkout, made)
+        workspace, checkout = mirror_session(name, conf)
+    attach_session(name, session, conf, workspace, checkout)
 
 
-def attach_session(name, session, conf, workspace, checkout, made):
-    """Give the session a workspace: tokens, agentty, reviewr, focus.
+def attach_session(name, session, conf, workspace, checkout):
+    """Give the session a workspace: tokens, agentty, focus.
 
     Shared by the first open and by promote(), which is this same setup run again
     once a mirror the first open could not build has become possible.
     """
     if workspace:
         # The worktree workspace is the session's workspace: herdr gives it the
-        # branch line in the sidebar, and open_reviewr() puts reviewr in it.
+        # branch line in the sidebar, and reviewr's own auto-open puts reviewr in it.
         top = herdr("pane", "list", "--workspace", workspace)["result"]["panes"][0]["pane_id"]
     else:
         created = herdr("workspace", "create",
@@ -1179,8 +1118,10 @@ def attach_session(name, session, conf, workspace, checkout, made):
     else:
         herdr("pane", "run", top, f"{hook}{agentty_cmd()} {host}")
         note(f"opened {workspace} for {name}: agentty in {top}")
-    if checkout and not made:
-        open_reviewr(workspace, top, checkout)  # a fresh worktree gets reviewr's own event
+    # reviewr opens itself on worktree.created and, since 0.36.2, on worktree.opened
+    # too, so a reused checkout gets a pane like a fresh mirror does. The
+    # open_reviewr() workaround for reviewr#82 was removed 2026-09-01 when that
+    # landed -- racing reviewr's own handler was what left two panes.
     herdr("workspace", "focus", workspace)
     return workspace
 
@@ -1207,10 +1148,10 @@ def promote(name, pane):
     conf = settings()
     old = pane_workspace(pane)
     ours = plugin_workspace(old, name)
-    workspace, checkout, made = mirror_session(name, conf)
+    workspace, checkout = mirror_session(name, conf)
     if not workspace:
         return None  # mirror_session has already said why
-    attach_session(name, session_named(name), conf, workspace, checkout, made)
+    attach_session(name, session_named(name), conf, workspace, checkout)
     if old and old != workspace:
         # The tokens are what open_workspaces() matches on, and what the sidebar
         # draws: left behind, the picker would go on focusing the workspace the
