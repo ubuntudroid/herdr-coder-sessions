@@ -137,8 +137,9 @@ previous UI settings, so a bad value costs a reload, not your sidebar). Omitting
 `fg` uses the default foreground, which is the only thing that follows the theme.
 
 Without a label of its own, a session's workspace falls back to what herdr derives:
-the mirror's branch name, or `~` when there is no mirror. The session name appears
-nowhere but `$coder_name`.
+the mirror's branch name — `coder-<session>` while the session has no branch of its
+own — or `~` when there is no mirror. The session name appears nowhere but
+`$coder_name`.
 
 Token names are a **global namespace** — `--source` scopes the sequence counter,
 not the name. Two plugins publishing `$coder_name` would overwrite each other, and
@@ -179,8 +180,10 @@ plugin reproduces the session locally and reviews that. On open it:
    diff, as files the branch never touched;
 4. fetches `+HEAD:<branch>` **straight from the workspace over ssh**, so commits the agent has
    not pushed are included, onto a local branch with the session's own name;
-5. creates a herdr worktree from that clone, which makes the workspace worktree-backed (herdr
-   then shows the branch under the name in the sidebar);
+5. creates a herdr worktree from that clone, which makes the workspace worktree-backed and
+   groups it under the repo's own workspace in the sidebar — on the session's branch when it has
+   one, [detached at the same commit](#when-the-session-has-no-branch-of-its-own) while it
+   shares the branch your clone has checked out;
 6. applies the session's uncommitted work: `git diff HEAD` for tracked files, plus a tar of
    `git ls-files -o --exclude-standard` for untracked ones.
 
@@ -215,20 +218,30 @@ to the session's current state. A marker in the worktree's git dir (not the work
 never shows in `git status`) records that the worktree is a mirror; without it the refresh
 refuses, so a worktree you made yourself is never reset.
 
-### When the session is still on your branch
+### When the session has no branch of its own
 
-A session that has not branched yet sits on `main`, and so does your clone: the only worktree
-on that branch is your own checkout, which the plugin will not reset. The session opens with
-the agent pane alone.
+A session that has not branched yet sits on `main`, and so does your clone. Git refuses the
+same branch in two worktrees, and `--force` grants it only by sharing the ref — every refresh
+resets the mirror hard, so that would reset your own branch out from under your checkout. The
+mirror is **detached** at the session's commit instead: the same files, sharing no ref,
+resetting nothing but its own `HEAD`. It lives at `mirror_root/<repo>/coder-<session>` — there
+is no branch to name the checkout after — and that basename is the label herdr gives the
+workspace.
 
-The idle hook stays on, and watches the branch instead of the mirror. The turn the agent
-branches, a pane splits in below the agent and asks whether to move the session into a mirror.
-`y` builds the worktree workspace, opens reviewr, and closes the agent's old pane — herdr
-collapses whatever that empties, so a session that had a workspace to itself takes it along,
-and one parked in a tab of yours loses only that tab. The single pane it will not close is the
-last one in a workspace this plugin did not open, because that would close your workspace too;
-agentty is left running there instead, and says so. `n` closes the offer, and nothing asks
-again until the branch changes.
+The turn the agent branches, the idle hook moves that same worktree onto the real branch with
+`git checkout -B` and renames the workspace to it. No second workspace, no pane to move, and
+reviewr resolves the PR from the branch name from then on. The checkout keeps the path it was
+created under: that names the session, which does not change.
+
+A mirror that could not be built at all — no local clone, or no commit shared with the session
+yet — leaves the session with the agent pane alone. Both can stop being true between turns, so
+the idle hook offers again: a pane splits in below the agent and asks whether to move the
+session into a mirror. `y` builds the worktree workspace, opens reviewr, and closes the agent's
+old pane — herdr collapses whatever that empties, so a session that had a workspace to itself
+takes it along, and one parked in a tab of yours loses only that tab. The single pane it will
+not close is the last one in a workspace this plugin did not open, because that would close
+your workspace too; agentty is left running there instead, and says so. `n` closes the offer,
+and nothing asks again until the branch changes.
 `prefix+ctrl+m` makes the same move whenever you want it.
 
 Two deliberate choices: the source refspec is `HEAD`, not the branch name, because a workspace
@@ -255,6 +268,12 @@ and the worktree already holds everything they produced.
 
 `takeover_agent` decides who picks it up: `"match"` (the default) uses whichever
 agent agentapi ran on the workspace, and a name always uses that one.
+
+A session with [no branch of its own](#when-the-session-has-no-branch-of-its-own)
+cannot be taken over: its mirror is detached, so a local agent's commits would
+land on no branch at all. The key says so and leaves the session alone — the
+branch name is yours to pick, and the mirror moves onto it by itself the turn the
+remote agent branches.
 
 The Coder workspace is **not** paused. A paused task is a stopped workspace, so
 pausing would remove the `ssh <session>.coder` the local agent is told to fall back
@@ -329,7 +348,7 @@ Nothing here fails with a traceback; each degrades to the next-best thing:
 | `fzf` | the picker refuses and points at `--list` / `--open` |
 | ssh to the session | the session opens without a mirror |
 | no local clone | the session opens without a mirror, naming the path it looked under and the config file to change |
-| a session still on the branch your clone has checked out | the session opens without a mirror, and is offered one the turn the agent branches |
+| a session still on the branch your clone has checked out | the mirror is detached at the same commit, and moves onto the session's branch the turn the agent creates one |
 | a shallow session clone | the mirror comes from `origin` instead, with the agent's commits folded into one diff |
 | reviewr | the agent pane opens alone |
 | reviewr below 0.30.0 | the base refresh can only guess `origin/HEAD`, so a `base_branches` base stays stale |
@@ -372,6 +391,7 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
 | `host_suffix` | `".coder"` | appended to the session name to form the ssh host |
 | `clone_root` | `"~/projects/github"` | where `<owner>/<repo>` clones live |
 | `mirror` | `true` | mirror the session into a local worktree on open |
+| `mirror_root` | `"~/.herdr/worktrees"` | where a mirror lives [while the session has no branch of its own](#when-the-session-has-no-branch-of-its-own), as `<root>/<repo>/coder-<session>`. herdr's own default, so both kinds of mirror land together; point it elsewhere if you moved `worktrees.directory` |
 | `takeover_agent` | `"match"` | which agent [takes a session over locally](#take-over-locally): `"match"` uses whichever agent ran on the workspace, `"claude"` or `"codex"` always uses that one |
 | `token_prefix` | `"coder_"` | namespace for the [sidebar tokens](#sidebar-tokens): this prefix plus `icon` / `ticket` / `name`. Change it if another plugin already claims those names, and mirror it in `rows` |
 

@@ -70,6 +70,10 @@ DEFAULTS = {
     "host_suffix": ".coder",  # ssh host is <session name> + this
     "clone_root": "~/projects/github",  # <clone_root>/<owner>/<repo>, as gh-dash maps it
     "mirror": True,        # mirror the session into a local worktree when we can
+    # Where a mirror lives while the session has no branch of its own. herdr names
+    # the checkout after the branch, which a detached one does not have, so the
+    # plugin picks the path -- herdr's own default, so both kinds land together.
+    "mirror_root": "~/.herdr/worktrees",
     # Which agent picks a session up locally. "match" uses whatever agentapi ran
     # on the workspace; a name ("claude", "codex") always uses that one, since the
     # handover is plain markdown and any agent can read any other's.
@@ -332,6 +336,27 @@ def mirror_marker(checkout):
 def claim_branch(clone, branch, tip):
     """Record that the plugin put `branch` at `tip`."""
     run(["git", "-C", clone, "update-ref", f"{MIRROR_REFS}/{branch}", tip])
+
+
+def claimable(clone, branch, base):
+    """Exit unless `branch` is the plugin's to move to `base`.
+
+    Forcing the branch is the point -- agents amend and rebase, so the base is
+    regularly not a descendant of where the branch sits. Only refuse when the tip
+    is somewhere the plugin did not put it, which means work that is not the
+    plugin's to move. An unrecorded branch predates that bookkeeping: force it as
+    this always did, and say so, since forcing writes a reflog either way.
+    """
+    existing = run(["git", "-C", clone, "rev-parse", "--verify", "-q",
+                    f"refs/heads/{branch}"], check=False).strip()
+    claimed = run(["git", "-C", clone, "rev-parse", "--verify", "-q",
+                   f"{MIRROR_REFS}/{branch}"], check=False).strip()
+    if existing and existing not in (base, claimed) and claimed:
+        sys.exit(f"local branch {branch} is at {existing[:12]}, not where this "
+                 f"plugin left it ({claimed[:12]}) -- refusing to move it")
+    if existing and existing != base and not claimed:
+        note(f"moving unrecorded local branch {branch} from {existing[:12]} to "
+             f"{base[:12]} (recover with `git -C {clone} reflog {branch}`)")
 
 
 def is_mirror(checkout):
@@ -621,43 +646,59 @@ def mirror_session(name, conf, focus=False):
              f"\n  {reason or 'nothing shared with the session'}")
         return None, None
 
-    checkout = worktree_for(clone, branch)
+    # A mirror is a worktree of the clone, which is also what herdr groups under
+    # the repo's own workspace in the sidebar. Which worktree depends on whether
+    # the session has a branch of its own: that branch when it has one, and a
+    # detached checkout of the same commit while it shares the clone's -- a
+    # session that has not branched yet sits on main, and so does the clone.
+    #
+    # Detached rather than a second checkout of that branch: git refuses the same
+    # branch in two worktrees, and `--force` grants it only by sharing the ref, so
+    # every refresh -- which resets the mirror hard -- would reset *your* branch
+    # out from under your own checkout. Detached shares nothing and resets nothing
+    # but its own HEAD, and holds the same files.
+    taken = worktree_for(clone, branch)
+    detached = bool(taken) and not is_mirror(taken)
+    pre = pre_branch_mirror(clone, name, conf)
+    checkout = (None if detached else taken) or \
+        (pre if os.path.exists(os.path.join(pre, ".git")) else None)
     if checkout:
         if not is_mirror(checkout):
-            # Nearly always the clone's own checkout: a session that has not
-            # branched yet sits on main, and so does the clone. Resetting either
-            # that or a worktree of your own would throw away work the plugin
-            # never made, so mirror nothing rather than refuse the session.
-            note(f"{branch} is checked out at {checkout}, which is not a mirror "
-                 f"(no {MIRROR_MARK} marker) -- {name} gets no mirror while it is "
-                 f"on that branch; the turn the agent branches it is offered one, "
-                 f"and prefix+ctrl+m moves it there")
+            # A takeover drops the marker, and its whole point is that nothing
+            # resets that worktree again.
+            note(f"{checkout} is not a mirror (no {MIRROR_MARK} marker) -- {name} "
+                 f"gets none while that worktree is there")
             return None, None
         run(["git", "-C", checkout, "reset", "-q", "--hard", base])
         run(["git", "-C", checkout, "clean", "-qfd"])
-        claim_branch(clone, branch, base)
         workspace = workspace_for_path(checkout)
         if workspace is None:
-            workspace = herdr("worktree", "open", "--cwd", clone, "--branch", branch,
+            workspace = herdr("worktree", "open", "--cwd", clone, "--path", checkout,
                               *(("--focus",) if focus else ("--no-focus",))
                               )["result"]["workspace"]["workspace_id"]
+        if not detached:
+            if checkout_branch(checkout) != branch:
+                # The session has branched since this mirror was built. Moved onto
+                # the branch here rather than replaced by a second worktree: the
+                # agentty pane and reviewr already live in this workspace, and
+                # reviewr resolves the PR from the branch the checkout is on, so
+                # from here on that has to be the session's real one. The checkout
+                # keeps the path it was created under -- that names the session,
+                # which does not change -- and the label becomes the branch, which
+                # is what herdr names a worktree workspace itself.
+                claimable(clone, branch, base)
+                run(["git", "-C", checkout, "checkout", "-q", "-B", branch, base])
+                herdr("workspace", "rename", workspace, branch)
+            claim_branch(clone, branch, base)
+    elif detached:
+        run(["git", "-C", clone, "worktree", "add", "-q", "--detach", pre, base])
+        checkout = pre
+        workspace = herdr("worktree", "open", "--cwd", clone, "--path", pre,
+                          *(("--focus",) if focus else ("--no-focus",))
+                          )["result"]["workspace"]["workspace_id"]
+        open(mirror_marker(checkout), "w").close()
     else:
-        # Forcing the branch is the point -- agents amend and rebase, so the base
-        # is regularly not a descendant of where the branch sits. Only refuse when
-        # the tip is somewhere the plugin did not put it, which means work that is
-        # not the plugin's to move. An unrecorded branch predates that bookkeeping:
-        # force it as this always did, and say so, since `git branch -f` writes a
-        # reflog either way.
-        existing = run(["git", "-C", clone, "rev-parse", "--verify", "-q",
-                        f"refs/heads/{branch}"], check=False).strip()
-        claimed = run(["git", "-C", clone, "rev-parse", "--verify", "-q",
-                       f"{MIRROR_REFS}/{branch}"], check=False).strip()
-        if existing and existing not in (base, claimed) and claimed:
-            sys.exit(f"local branch {branch} is at {existing[:12]}, not where this "
-                     f"plugin left it ({claimed[:12]}) -- refusing to move it")
-        if existing and existing != base and not claimed:
-            note(f"moving unrecorded local branch {branch} from {existing[:12]} to "
-                 f"{base[:12]} (recover with `git -C {clone} reflog {branch}`)")
+        claimable(clone, branch, base)
         run(["git", "-C", clone, "branch", "-f", branch, base])
         claim_branch(clone, branch, base)
         created = herdr("worktree", "create", "--cwd", clone, "--branch", branch,
@@ -674,8 +715,20 @@ def mirror_session(name, conf, focus=False):
                  f"refusing to review the wrong commits")
 
     apply_session_changes(host, repo, checkout, base)
-    note(f"mirrored {name} at {checkout} ({branch} @ {base[:12]}){source}")
+    where = f"{branch}, detached" if detached else branch
+    note(f"mirrored {name} at {checkout} ({where} @ {base[:12]}){source}")
     return workspace, checkout
+
+
+def pre_branch_mirror(clone, name, conf):
+    """Where a mirror sits while the session has no branch of its own.
+
+    Named after the session rather than a branch, because a detached checkout has
+    none -- and it keeps the name after it moves onto one, since the session is
+    what the workspace is for. herdr labels the workspace from this basename.
+    """
+    return os.path.join(os.path.expanduser(conf["mirror_root"]),
+                        os.path.basename(clone), f"coder-{name}")
 
 
 def worktree_for(clone, branch):
@@ -1261,13 +1314,21 @@ def takeover(name):
     # session that does not have one yet -- right for opening a session, wrong
     # here: a takeover ends an *existing* mirror, so a session whose agentty
     # pane sits in a mirrorless workspace (the promote offer was declined, or
-    # never reached because the agent had not branched) has nothing to end.
+    # never reached because a mirror could not be built) has nothing to end.
     # Checked first, off local herdr state only, before the ssh calls below --
     # and before mirror_session can build the stray workspace this replaces.
     existing = open_workspaces().get(name)
     if not existing or not mirror_workspace(existing):
         sys.exit(f"{name} has no mirror to take over -- prefix+ctrl+m moves it "
                  f"into one first")
+    # A mirror of a session with no branch of its own is detached, and a local
+    # agent committing there would put its work on no branch at all. Refused
+    # rather than branched for you: the name is yours to pick, and the turn the
+    # agent branches the mirror moves onto that branch on its own.
+    if checkout_branch((workspace_info(existing).get("worktree") or {})
+                       .get("checkout_path", "")) == "HEAD":
+        sys.exit(f"{name} has no branch of its own yet, so its mirror is detached "
+                 f"-- take it over once the agent has branched")
     session = session_named(name)
 
     kind = remote_agent(host)
@@ -1362,11 +1423,12 @@ def asked_before(name, branch):
 def turn_finished(name):
     """The idle hook: refresh the mirror, or offer one that has become possible.
 
-    A workspace with no mirror is one opened while the session sat on the branch
-    the clone has checked out -- usually main, before the agent branched. Nothing
-    could be mirrored then, so here the hook watches the branch instead and offers
-    once it changes: in a split beside the agent, unfocused, because this fires
-    mid-work and must not swallow what is being typed at the session.
+    A workspace with no mirror is one whose mirror could not be built when the
+    session was opened: no local clone yet, or no commit shared with the session
+    to sit on. Both can stop being true between turns -- a clone appears, a fetch
+    succeeds -- so the hook offers again: in a split beside the agent, unfocused,
+    because this fires mid-work and must not swallow what is being typed at the
+    session.
     """
     conf = settings()
     pane = os.environ.get("HERDR_PANE_ID", "")  # agentty's pane; the hook is its child
@@ -1378,9 +1440,6 @@ def turn_finished(name):
     clone = clone_path(slug, conf["clone_root"])
     if not branch or not clone:
         return None
-    taken = worktree_for(clone, branch)
-    if taken and not is_mirror(taken):
-        return None  # still a checkout of yours; there is nothing to offer yet
     if asked_before(name, branch):
         return None
     return herdr("plugin", "pane", "open",
@@ -1402,8 +1461,8 @@ def promote_pane():
     branch = os.environ.get("CODER_BRANCH", "a branch of its own")
     if not name or not pane:
         sys.exit("nothing to promote (CODER_SESSION/CODER_PANE unset)")
-    print(f"{name} is on {branch} now, so it can be mirrored: a worktree workspace "
-          f"with the review pane, and the agent moved into it.")
+    print(f"{name} can be mirrored now ({branch}): a worktree workspace with the "
+          f"review pane, and the agent moved into it.")
     try:
         answer = input("move it there? [y/N]  (prefix+ctrl+m does this later) ")
     except EOFError:
@@ -1473,9 +1532,9 @@ def refresh(workspace=None):
             == ICON_TAKEN:
         sys.exit(f"{name} was taken over locally -- its worktree is yours now and "
                  f"nothing resets it, so there is no mirror left to refresh")
-    # No mirror to refresh: this workspace was opened while the session sat on the
-    # clone's own branch. Moving it into a mirror is the useful thing the key can
-    # do instead, and the keypress is the consent the idle hook has to ask for.
+    # No mirror to refresh: building one failed when this workspace was opened.
+    # Moving the session into a mirror is the useful thing the key can do instead,
+    # and the keypress is the consent the idle hook has to ask for.
     pane = session_pane(workspace)
     if not pane:
         sys.exit(f"no agentty pane in {workspace} -- nothing to refresh or promote")
@@ -1579,6 +1638,9 @@ def selftest():
     assert repo_slug("") is None
     assert clone_path(None, "~/projects/github") is None
     assert clone_path("Nope/nope", "~/projects/github") is None
+
+    assert pre_branch_mirror("/c/photoroom/photoroom_android", "task-1",
+                             {"mirror_root": "/wt"}) == "/wt/photoroom_android/coder-task-1"
 
     assert branch_ticket("automations/con2-106-support-multiple-placeholders") == "CON2-106"
     assert branch_ticket("proj-4031-disabled-personal-space-credit-tests") == "PROJ-4031"
