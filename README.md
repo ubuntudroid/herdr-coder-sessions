@@ -237,6 +237,11 @@ The turn the agent branches, the idle hook moves that same worktree onto the rea
 reviewr resolves the PR from the branch name from then on. The checkout keeps the path it was
 created under: that names the session, which does not change.
 
+Every later branch the agent moves to is the same move again. A mirror is found by the session
+it belongs to, not by the branch it happens to sit on, so an agent that abandons one branch for
+another takes its one workspace with it — agentty, reviewr and all. Only the workspace label
+follows the branch.
+
 A mirror that could not be built at all — no local clone, or no commit shared with the session
 yet — leaves the session with the agent pane alone. Both can stop being true between turns, so
 the idle hook offers again: a pane splits in below the agent and asks whether to move the

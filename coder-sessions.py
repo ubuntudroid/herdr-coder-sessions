@@ -387,6 +387,21 @@ def clone_path(slug, clone_root):
     return path if os.path.isdir(os.path.join(path, ".git")) else None
 
 
+def own_mirror(name):
+    """This session's own mirror checkout, whatever branch it sits on, or "".
+
+    Read off the session's workspace rather than off the branch, so that a session
+    which switches branches keeps the one workspace agentty and reviewr live in
+    and mirror_session moves that worktree onto the new branch. Resolved by branch
+    alone, the second branch builds a second worktree beside the first and leaves
+    the agent behind in it, with no agentty for a refresh or a takeover to find.
+    """
+    workspace = open_workspaces().get(name)
+    checkout = ((workspace_info(workspace).get("worktree") or {})
+                .get("checkout_path", "")) if workspace else ""
+    return checkout if os.path.isdir(checkout) and is_mirror(checkout) else ""
+
+
 def ssh_out(host, command, check=True):
     """Run one command on the session host. Trailing newline stripped: a stray
     CR here silently corrupts a git refspec."""
@@ -660,7 +675,7 @@ def mirror_session(name, conf, focus=False):
     taken = worktree_for(clone, branch)
     detached = bool(taken) and not is_mirror(taken)
     pre = pre_branch_mirror(clone, name, conf)
-    checkout = (None if detached else taken) or \
+    checkout = own_mirror(name) or (None if detached else taken) or \
         (pre if os.path.exists(os.path.join(pre, ".git")) else None)
     if checkout:
         if not is_mirror(checkout):
@@ -669,8 +684,6 @@ def mirror_session(name, conf, focus=False):
             note(f"{checkout} is not a mirror (no {MIRROR_MARK} marker) -- {name} "
                  f"gets none while that worktree is there")
             return None, None
-        run(["git", "-C", checkout, "reset", "-q", "--hard", base])
-        run(["git", "-C", checkout, "clean", "-qfd"])
         workspace = workspace_for_path(checkout)
         if workspace is None:
             workspace = herdr("worktree", "open", "--cwd", clone, "--path", checkout,
@@ -687,9 +700,26 @@ def mirror_session(name, conf, focus=False):
                 # which does not change -- and the label becomes the branch, which
                 # is what herdr names a worktree workspace itself.
                 claimable(clone, branch, base)
-                run(["git", "-C", checkout, "checkout", "-q", "-B", branch, base])
+                run(["git", "-C", checkout, "checkout", "-q", "-f", "-B", branch, base])
                 herdr("workspace", "rename", workspace, branch)
             claim_branch(clone, branch, base)
+        elif checkout_branch(checkout) != "HEAD":
+            # The session's branch is checked out somewhere else, so this mirror
+            # goes back to detached instead of keeping the branch it is on: the
+            # reset below would otherwise drag that branch up to another branch's
+            # commit, and claimable() then refuses to move it when the session
+            # returns to it.
+            # ponytail: the workspace keeps the old branch's label, so its icon
+            # token and reviewr's PR tab go blank while the branch is held
+            # elsewhere. Name it when someone actually works that way.
+            run(["git", "-C", checkout, "checkout", "-q", "-f", "--detach", base])
+        # After the branch is settled, never before: a reset run first moves
+        # whichever branch the mirror is leaving, which is the same corruption
+        # the detached case above avoids. -f on the checkouts because the mirror
+        # carries the last refresh's uncommitted work and a plain checkout
+        # refuses to drop it.
+        run(["git", "-C", checkout, "reset", "-q", "--hard", base])
+        run(["git", "-C", checkout, "clean", "-qfd"])
     elif detached:
         run(["git", "-C", clone, "worktree", "add", "-q", "--detach", pre, base])
         checkout = pre
