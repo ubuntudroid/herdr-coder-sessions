@@ -1345,7 +1345,7 @@ def takeover(name):
     if not path:
         sys.exit(f"no {kind} history for {name} on {host} -- nothing to hand over")
 
-    workspace, checkout, _ = mirror_session(name, conf, focus=True)
+    workspace, checkout = mirror_session(name, conf, focus=True)
     if not checkout:
         return None  # mirror_session has already said why
 
