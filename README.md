@@ -200,9 +200,13 @@ still there for whatever tool you prefer.
 
 - **After every agent turn.** The plugin launches agentty with
   `AGENTTY_ON_IDLE="<script> --mirror <session>"`, and agentty runs that hook when the agent's
-  status goes `running → stable`. It already watches `/events` for the dot, so nothing polls, and
-  the refresh lands exactly when new work exists and nothing is mid-write. `AGENTTY_ON_IDLE` is
-  generic — agentty knows nothing about this plugin.
+  status goes `running → stable` *and* the screen moved in between. It already watches `/events`
+  for the dot, so nothing polls, and the refresh lands exactly when new work exists and nothing
+  is mid-write. The screen half of that test is what keeps a turn a turn: agentapi calls any
+  write to the agent's pty `running`, and the claude it runs repaints to the identical screen
+  every 30 minutes, which without it would refresh a mirror with nothing to mirror and leave a
+  blue `done` dot on a session nobody touched. `AGENTTY_ON_IDLE` is generic — agentty knows
+  nothing about this plugin.
 - **On demand**, with `prefix+ctrl+m` (the `refresh` action), which refreshes the focused
   workspace's mirror — or, in a workspace that has none yet, moves the session into one. It
   reads the session name from the [`$coder_name` token](#sidebar-tokens), so it needs no argument,
@@ -369,8 +373,12 @@ local echo (the round trip to a remote workspace is ~600 ms), suppression of the
 agent's empty-composer hint, and folding for panes narrower than the agent.
 Shift+Enter inserts a newline: herdr sends it as xterm modifyOtherKeys, which
 the agent ignores, so it is rewritten to the ESC+CR the agent reads as one.
-`Ctrl+]` quits; `agentty --selftest` checks the pure helpers. Inside a herdr pane
-it also reports the remote agent's state, so the session gets a real agent dot.
+`Ctrl+]` quits; `agentty --selftest` checks the pure helpers and
+`agentty --wiringtest` drives the two reporting threads against a fake agentapi
+(a port and ~8s, which is why it is its own flag). Inside a herdr pane it also
+reports the remote agent's state, so the session gets a real agent dot —
+withholding a `running` the screen never backed up, since agentapi reports one
+for any write to the agent's pty, repaints included.
 
 Standalone install — it is one stdlib-only file, so copying it is the whole
 procedure:

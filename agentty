@@ -15,6 +15,7 @@ Every other key goes to the agent unchanged. Ctrl+] quits.
 """
 
 import http.client
+import itertools
 import json
 import os
 import queue
@@ -78,6 +79,11 @@ class State:
         self.dirty = True
         self.stop = False
         self.error = ""
+        # The turn the agent is in, as far as herdr has been told: None settled,
+        # "armed" running with the working report withheld, "working" reported.
+        self.turn = None
+        self.settled = None  # the last frame from outside an armed turn
+        self.agent = None  # herdr agent name, for the report read_screen makes
         self.lock = threading.Lock()
 
 
@@ -159,6 +165,11 @@ HERDR_PANE = os.environ.get("HERDR_PANE_ID")
 # agentapi's AgentStatus is only stable|running, so there is no blocked state to
 # mirror; an agent_error event is surfaced as unknown plus its message.
 HERDR_STATE = {"running": "working", "stable": "idle"}
+# Seeded from the clock, not 0: herdr drops any report whose seq is below the one
+# it holds, so a restarted client counting from 0 sits under the previous run's
+# last seq and the pane keeps that run's stale dot. Shared, because both threads
+# that report -- watch_status and read_screen -- have to order against each other.
+SEQ = itertools.count(int(time.time()))
 
 
 def agent_label(target):
@@ -188,19 +199,36 @@ def report_agent(label, state, seq, message=None):
     subprocess.run(argv, capture_output=True)
 
 
+def turn_state(turn, status):
+    """Fold an agentapi status into (what to report to herdr, the next turn).
+
+    `None` to report means say nothing. agentapi calls any write to the agent's
+    pty "running", and a claude under it rewrites the identical screen every 30
+    minutes. Reported, that frame reads to herdr as a turn finishing unseen: a
+    blue "done" dot on a session nobody touched, and an on_idle mirror refresh
+    with nothing to mirror. So a `running` is withheld until the screen changes
+    -- read_screen promotes "armed" to "working" -- and the `stable` closing a
+    turn that never got that far is withheld with it.
+    """
+    if status == "running":
+        return None, "armed"
+    if status != "stable":
+        return "unknown", None
+    return ("idle" if turn == "working" else None), None
+
+
 def watch_status(base, label, st):
     """Report the agent's status to herdr: once from /status, then on each change."""
-    # Seeded from the clock, not 0: herdr drops any report whose seq is below the
-    # one it holds, so a restarted client counting from 0 sits under the previous
-    # run's last seq and the pane keeps that run's stale dot.
-    seq = int(time.time())
+    st.agent = label
     while not st.stop:
         try:
             with urllib.request.urlopen(base + "/status") as resp:
                 status = json.load(resp).get("status")
-            seq += 1
-            report_agent(label, HERDR_STATE.get(status, "unknown"), seq)
-            was_running = status == "running"
+            # The first report is the live status, withheld from nothing: an
+            # attach mid-turn has no earlier screen to have found unchanged.
+            report_agent(label, HERDR_STATE.get(status, "unknown"), next(SEQ))
+            with st.lock:
+                st.turn = "working" if status == "running" else None
             with urllib.request.urlopen(base + "/events") as resp:
                 event = None
                 for raw in resp:
@@ -215,19 +243,21 @@ def watch_status(base, label, st):
                             payload = json.loads(line[5:].strip())
                         except ValueError:
                             continue
-                        seq += 1
                         if event == "agent_error":
-                            report_agent(label, "unknown", seq,
+                            report_agent(label, "unknown", next(SEQ),
                                          payload.get("message") or "agent error")
-                        else:
-                            status = payload.get("status")
-                            report_agent(label, HERDR_STATE.get(status, "unknown"), seq)
-                            # A turn just ended: new work exists and nothing is
-                            # mid-write. That is the moment a mirror is worth
-                            # refreshing.
-                            if status == "stable" and was_running:
-                                on_idle()
-                            was_running = status == "running"
+                            continue
+                        with st.lock:
+                            state, st.turn = turn_state(st.turn,
+                                                        payload.get("status"))
+                            seq = next(SEQ) if state else None
+                        if state:
+                            report_agent(label, state, seq)
+                        # A turn just ended: new work exists and nothing is
+                        # mid-write. That is the moment a mirror is worth
+                        # refreshing.
+                        if state == "idle":
+                            on_idle()
         except Exception:
             time.sleep(2)  # server restart or tunnel blip; try again
 
@@ -258,6 +288,22 @@ def read_screen(base, st):
                         lines[caret[0]] = strip_placeholder(lines[caret[0]])
                     width = max((len(line) for line in lines), default=0)
                     with st.lock:
+                        # The screen changing is what makes a `running` a turn
+                        # rather than a repaint, so it is what releases the
+                        # working report turn_state withheld. Any frame outside
+                        # an armed turn becomes the screen the next one is judged
+                        # against, and it is judged here rather than in
+                        # watch_status because only this thread knows when a
+                        # frame has actually landed: seeding the reference from
+                        # watch_status races the first frame and leaves a turn
+                        # judged against "connecting...". The seq is drawn under
+                        # the lock so that it orders the way the states did.
+                        seq = (next(SEQ) if st.turn == "armed"
+                               and lines != st.settled else None)
+                        if seq:
+                            st.turn = "working"
+                        if st.turn != "armed":
+                            st.settled = lines
                         st.lines = lines
                         st.width = width
                         if st.pred:
@@ -272,6 +318,8 @@ def read_screen(base, st):
                                 st.pred = None  # done waiting; server wins
                         st.error = ""
                         st.dirty = True
+                    if seq:  # outside the lock: report_agent forks herdr
+                        report_agent(st.agent, "working", seq)
         except Exception as exc:  # server restart, tunnel blip
             with st.lock:
                 st.error = f"reconnecting: {exc}"
@@ -485,6 +533,14 @@ def selftest():
     assert strip_mouse(b"hi\x1b[<64;1;1Mthere") == (b"hithere", 1)  # mixed read
     assert strip_mouse(b"\x1b[5~") == (b"\x1b[5~", 0)           # PgUp untouched
 
+    # A turn is a `running` the screen backed up. The 30-minute repaint is not
+    # one, and neither its start nor the `stable` closing it is worth a report.
+    assert turn_state(None, "running") == (None, "armed")
+    assert turn_state("armed", "stable") == (None, None)      # the repaint
+    assert turn_state("working", "stable") == ("idle", None)  # a real turn
+    assert turn_state(None, "stable") == (None, None)         # already settled
+    assert turn_state("armed", "gone") == ("unknown", None)   # not a turn either
+
     # Shift+Enter must land as a newline: not submit (track_caret would zero),
     # not a local scroll key.
     assert REWRITE[b"\x1b[27;2;13~"] == b"\x1b\r"
@@ -560,6 +616,96 @@ def selftest():
     assert composer_text("› hi ") == "› hi"
     assert apply_edit("› hi ", 0, b"x") == "› hi x"
     print("selftest ok")
+
+
+def wiringtest():
+    """Drive both reporting threads against a fake agentapi.
+
+    Kept out of --selftest, which is pure and instant: this one binds a port and
+    sleeps for the SSE hand-offs. It is the only check that reaches the release
+    -- an armed turn promoted to a reported one, which happens in read_screen
+    and so is out of turn_state's reach -- and the only one that would catch a
+    reference screen seeded from the wrong thread.
+    """
+    import http.server  # test-only: agentty itself never serves
+
+    reports, idled = [], []
+    globals()["report_agent"] = (
+        lambda label, state, seq, message=None: reports.append(state))
+    globals()["on_idle"] = lambda: idled.append(1)
+    status, screen, events = {"v": "stable"}, {"v": "hello"}, queue.Queue()
+
+    class Fake(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path == "/status":
+                body = json.dumps({"status": status["v"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return self.wfile.write(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            if self.path == "/events":
+                while True:
+                    event, payload = events.get()
+                    self.wfile.write(
+                        f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode())
+                    self.wfile.flush()
+            # A late first frame, then one per tick whether or not the screen
+            # moved. Both halves matter: /status answers before any frame lands,
+            # so a reference screen taken outside read_screen is still
+            # "connecting..." when the first turn is judged against it, and
+            # agentapi may well emit a frame per pty write, repaints included.
+            time.sleep(0.5)
+            while True:
+                self.wfile.write(
+                    f"data: {json.dumps({'screen': screen['v']})}\n\n".encode())
+                self.wfile.flush()
+                time.sleep(0.05)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    st = State()
+    threading.Thread(target=read_screen, args=(base, st), daemon=True).start()
+    threading.Thread(target=watch_status, args=(base, "sess", st),
+                     daemon=True).start()
+
+    def announce(value, moves_to=None):
+        """One status_change, optionally moving the screen the way a turn does."""
+        status["v"] = value
+        events.put(("status_change", {"status": value}))
+        if moves_to:
+            time.sleep(0.3)
+            screen["v"] = moves_to
+        time.sleep(1.2)
+
+    time.sleep(1.5)
+    assert reports == ["idle"], reports  # the attach-time /status report
+
+    announce("running")  # the 30-minute repaint: no frame differs from the last
+    assert st.turn == "armed", st.turn
+    announce("stable")
+    assert reports == ["idle"], f"a repaint was reported as a turn: {reports}"
+    assert not idled, "a repaint fired the turn-finished hook"
+
+    announce("running", "hello\nesc to interrupt")  # a turn, screen and all
+    assert reports == ["idle", "working"], reports
+    announce("stable")
+    assert reports == ["idle", "working", "idle"], reports
+    assert idled, "a turn did not fire the turn-finished hook"
+
+    events.put(("agent_error", {"message": "boom"}))
+    time.sleep(1.2)
+    assert reports == ["idle", "working", "idle", "unknown"], reports
+
+    st.stop = True
+    print("wiringtest ok")
 
 
 def sender(base, outbox, st):
@@ -660,6 +806,8 @@ def main():
         sys.exit(__doc__)
     if sys.argv[1] == "--selftest":
         return selftest()
+    if sys.argv[1] == "--wiringtest":
+        return wiringtest()
     if not sys.stdin.isatty():
         # It drives a terminal directly: raw mode, an alt screen, cursor keys.
         # Without one, termios would raise from the middle of the setup instead.
