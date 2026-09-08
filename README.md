@@ -85,10 +85,12 @@ A plugin action runs with no terminal, so anything it prints goes nowhere anyone
 The refresh and take-over keys say what they are doing in a herdr notification instead:
 one when the ssh work starts, because both spend seconds on the network before there is
 anything to look at, and one when a refresh finishes — a take-over ends in a pane you can
-see, so it needs none. A failure notifies either way, and also lands in
-`coder-sessions.log` under `HERDR_PLUGIN_STATE_DIR`. The idle hook's own refresh runs
-through `--mirror` and stays silent, so this is one notification per keypress, never one
-per agent turn.
+see, so it needs none — nor does moving a session into a mirror, which the refresh key
+does in a workspace that has none yet. A failure from a keypress notifies as well, and
+every failure lands in `coder-sessions.log` under `HERDR_PLUGIN_STATE_DIR`. The idle
+hook's own refresh runs through `--mirror` and says nothing at all, failures included:
+a mirror that cannot be built yet would otherwise notify after every agent turn. One
+notification per keypress, never one per turn.
 
 Or, without installing the plugin, point a popup straight at the script:
 

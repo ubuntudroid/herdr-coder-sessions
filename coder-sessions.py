@@ -60,6 +60,12 @@ STATE = (os.environ.get("HERDR_PLUGIN_STATE_DIR")
 CACHE = os.path.join(STATE, f"coder-sessions-{os.getuid()}.json")
 LOG = os.path.join(STATE, "coder-sessions.log")
 SELF = os.path.abspath(__file__)
+# Is this run agentty's turn-finished hook? It reaches us as `--mirror <name>`, and
+# agentty gives it no stdin, so the no-terminal test hold() uses cannot tell it from
+# a keypress. Only a keypress may notify: a failure the hook keeps hitting -- no
+# clone yet, nothing shared with the session -- would otherwise raise the same
+# notification after every agent turn, forever. The log still gets it.
+IDLE_HOOK = "--mirror" in sys.argv
 
 try:
     os.makedirs(STATE, exist_ok=True)
@@ -1581,6 +1587,10 @@ def refresh(workspace=None):
     pane = session_pane(workspace)
     if not pane:
         sys.exit(f"no agentty pane in {workspace} -- nothing to refresh or promote")
+    # The same ssh and fetch the branch above notifies for, so the same wait with
+    # nothing on screen. No second notification: promote ends in a workspace of
+    # panes you can see, the way the takeover does.
+    notify(f"Mirroring {name}", "fetching the session over ssh")
     promote(name, pane)
 
 
@@ -1925,6 +1935,8 @@ def hold(text):
             input("press enter to close ")
         except (EOFError, KeyboardInterrupt):
             pass
+        return
+    if IDLE_HOOK:
         return
     # The last line, because a traceback's is the exception and the frames above
     # it will not fit.
