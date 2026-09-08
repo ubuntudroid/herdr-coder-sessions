@@ -1359,6 +1359,11 @@ def takeover(name):
                        .get("checkout_path", "")) == "HEAD":
         sys.exit(f"{name} has no branch of its own yet, so its mirror is detached "
                  f"-- take it over once the agent has branched")
+    # Said before the first remote call, not after: everything below is ssh and a
+    # fetch, which is seconds of a keybinding looking like it did nothing. The
+    # local guards above are instant, and a refusal from one of them is better as
+    # its own notification alone than under a "starting" that was never true.
+    notify(f"Taking over {name}", "reading the session over ssh")
     session = session_named(name)
 
     kind = remote_agent(host)
@@ -1550,7 +1555,15 @@ def refresh(workspace=None):
     workspace, name = focused_session(workspace)
     conf = settings()
     if mirror_workspace(workspace):
-        return mirror_session(name, conf)
+        # Both ends said, where the takeover says only that it started: a takeover
+        # ends in a pane you can see, and a refresh that worked changes files
+        # nobody is looking at. The idle hook comes through --mirror, not here, so
+        # this is a keypress every time and never a toast on every agent turn.
+        notify(f"Refreshing {name}", "fetching the session over ssh")
+        done = mirror_session(name, conf)
+        notify(f"{name} mirror refreshed" if done[1] else f"{name} has no mirror",
+               done[1] or f"see {LOG}")
+        return done
     # Taken over: the worktree is the user's now, the marker is gone, and there is
     # no agentty left to promote. Worth its own sentence, because the generic
     # "no agentty pane" below names the symptom and leaves the cause to be guessed
@@ -1886,9 +1899,25 @@ def note(text):
     log_line(text)
 
 
+def notify(title, body=""):
+    """Raise a herdr notification. The only channel a plugin action has: it runs
+    with no terminal, so its stdout and stderr go nowhere anyone sees.
+
+    Not the herdr() helper: this reports, and a reporting call that exits on a
+    failure of its own would replace the thing being reported. Never raises.
+    """
+    try:
+        subprocess.run([HERDR, "notification", "show", title,
+                        *(("--body", body) if body else ())], capture_output=True)
+    except OSError:
+        pass
+
+
 def hold(text):
     """Report a failure so it can actually be read: log it, then wait for a key
-    when there is a terminal to wait on."""
+    when there is a terminal to wait on, and raise a herdr notification when there
+    is not. A plugin action runs with no terminal at all, so without the
+    notification its only symptom is a keybinding that appears to do nothing."""
     log_line(text)
     print(f"\n{text}\n\n({LOG})", file=sys.stderr)
     if sys.stdin.isatty():
@@ -1896,6 +1925,11 @@ def hold(text):
             input("press enter to close ")
         except (EOFError, KeyboardInterrupt):
             pass
+        return
+    # The last line, because a traceback's is the exception and the frames above
+    # it will not fit.
+    line = (text.strip().splitlines() or [""])[-1][:200]
+    notify("Coder sessions failed", f"{line}\n{LOG}")
 
 
 if __name__ == "__main__":

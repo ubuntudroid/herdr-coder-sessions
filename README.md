@@ -81,6 +81,15 @@ the focused session's page in the Coder web UI — see [The web UI](#the-web-ui)
 fourth ends the remote flow and continues it locally — see
 [Take over locally](#take-over-locally).
 
+A plugin action runs with no terminal, so anything it prints goes nowhere anyone sees.
+The refresh and take-over keys say what they are doing in a herdr notification instead:
+one when the ssh work starts, because both spend seconds on the network before there is
+anything to look at, and one when a refresh finishes — a take-over ends in a pane you can
+see, so it needs none. A failure notifies either way, and also lands in
+`coder-sessions.log` under `HERDR_PLUGIN_STATE_DIR`. The idle hook's own refresh runs
+through `--mirror` and stays silent, so this is one notification per keypress, never one
+per agent turn.
+
 Or, without installing the plugin, point a popup straight at the script:
 
 ```toml
