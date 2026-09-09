@@ -393,6 +393,8 @@ def track_caret(data, back):
     delta = CARET_MOVE.get(data)
     if delta is not None:
         return None if back is None else max(0, back + delta)
+    if data == b"\x1b\x7f":
+        return back  # Alt+Backspace: a word goes, but only before the caret
     if b"\x1b" in data or b"\x01" in data:
         return None  # a movement we don't model (Alt+arrows, Ctrl+A, ...)
     return back  # typing and backspace both leave the offset from the end alone
@@ -570,6 +572,7 @@ def selftest():
     assert track_caret(b"\x7f", 3) == 3         # backspace mid-line: unchanged
     assert track_caret(b"\r", 5) == 0           # submit returns to the end
     assert track_caret(b"\x0b", 5) == 0         # Ctrl+K kills to the end
+    assert track_caret(b"\x1b\x7f", 3) == 3     # Alt+Backspace: a word before it
     assert track_caret(b"\x1b[1;3D", 2) is None  # Alt+Left: unmodelled, so unknown
     assert track_caret(b"\x1b[C", None) is None  # unknown stays unknown
     assert track_caret(b"\r", None) == 0         # ...until the next submit
@@ -606,6 +609,27 @@ def selftest():
     assert w == ["ab", "", "cd"] and c == (2, 2), (w, c)
     w, c = wrap_lines(["abc"], 3, (0, 3))  # caret just past a full-width line
     assert w == ["abc"] and c == (0, 2), (w, c)
+
+    # An offset the client cannot model must still leave a cursor on screen: a
+    # pane with no cursor reads as hung. Alt+Backspace used to do exactly that.
+    import io  # test-only: agentty writes to the real stdout
+    st = State()
+    st.lines, st.width = ["out", rule, "› hi", footer], 40
+    size, out = os.get_terminal_size, sys.stdout
+    os.get_terminal_size = lambda *a: (67, 10)
+
+    def drawn(back):
+        st.caret_back = back
+        sys.stdout = io.StringIO()
+        render(st)
+        return sys.stdout.getvalue()
+
+    try:
+        unknown, known = drawn(None), drawn(1)
+    finally:
+        os.get_terminal_size, sys.stdout = size, out
+    assert "\x1b[3;5H\x1b[?25h" in unknown, repr(unknown[-30:])  # parked at the end
+    assert "\x1b[3;4H\x1b[?25h" in known, repr(known[-30:])
 
     assert predictable("› hi" + " " * 63, "› hit", 67)      # room left
     assert not predictable("› x" * 30, "› " + "y" * 66, 67)  # echo outgrew the agent
@@ -767,9 +791,13 @@ def render(st):
         # is invisible, but the caret still has to move past it.
         spot = (spot[0], len(pred[1]))
 
+    # An offset we could not model (Ctrl+A, Alt+arrows) parks the cursor at the
+    # end of the composer instead of taking it off the screen: a pane with no
+    # cursor at all reads as hung, and the end is where the caret usually is.
     caret_abs = None
-    if not scroll and back is not None and spot and back <= spot[1]:
-        caret_abs = (spot[0], spot[1] - back)
+    if not scroll and spot:
+        floor = prompt_prefix(lines[spot[0]])
+        caret_abs = (spot[0], max(floor, spot[1] - (back or 0)))
     lines, caret = wrap_lines(lines, cols, caret_abs)
     view, above, below = viewport(lines, body, scroll)
 
