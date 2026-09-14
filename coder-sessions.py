@@ -32,7 +32,7 @@ a plugin cannot add it for you.
 Settings, all optional, in $HERDR_PLUGIN_CONFIG_DIR/config.json:
 
     {"host_suffix": ".coder", "clone_root": "~/projects/github", "mirror": true,
-     "takeover_agent": "match", "token_prefix": "coder_"}
+     "takeover_agent": "match", "branch_prefix": "", "token_prefix": "coder_"}
 """
 
 import argparse
@@ -84,6 +84,10 @@ DEFAULTS = {
     # on the workspace; a name ("claude", "codex") always uses that one, since the
     # handover is plain markdown and any agent can read any other's.
     "takeover_agent": "match",
+    # Prefix for the branch a branchless takeover suggests when Linear cannot
+    # name the ticket: "sven/" gives "sven/con2-150-<task>". Linear's own names
+    # already carry one, so this shapes the fallback only.
+    "branch_prefix": "",
     # Namespace for this plugin's sidebar metadata tokens: the prefix plus each
     # name in TOKEN_SUFFIXES, rendered by `ui.sidebar.spaces.rows` as
     # `$coder_icon` and so on. Prefixed because the token namespace is global --
@@ -282,6 +286,62 @@ def readable_name(session, limit=28, branch=""):
     if not text:
         return session["name"]
     return text[:limit].rstrip() + "…" if len(text) > limit else text
+
+
+def slug(text, limit=50):
+    """Free text as a branch segment, cut the way Linear cuts its own names.
+
+    Apostrophes go rather than split ("engine's" -> "engines"), which is what
+    Linear does and what keeps a fallback name looking like a Linear one.
+    """
+    text = SLACK_MARKUP.sub(" ", text or "").replace("'", "").lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text[:limit].rsplit("-", 1)[0] if len(text) > limit else text
+
+
+def linear_branch(ticket):
+    """Linear's own branch name for a ticket, via the `linear` CLI, or "".
+
+    Optional by design: no CLI, no login, no such issue, or no answer in ten
+    seconds all fall through to the fallback suggestion, so nothing here exits.
+    Not run(): that exits on a missing binary. The ticket matched TICKET_RE, so
+    it cannot break out of the quoted query.
+    """
+    query = 'query { issue(id: "%s") { branchName } }' % ticket
+    try:
+        proc = subprocess.run(["linear", "api", query], capture_output=True,
+                              text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log_line(f"no branch name from Linear for {ticket}: {exc}")
+        return ""
+    if proc.returncode != 0:
+        log_line(f"no branch name from Linear for {ticket}: "
+                 f"{(proc.stderr or proc.stdout).strip()[:200]}")
+        return ""
+    try:
+        return json.loads(proc.stdout)["data"]["issue"]["branchName"] or ""
+    except (ValueError, KeyError, TypeError):
+        log_line(f"Linear answered without a branchName for {ticket}: {proc.stdout[:200]}")
+        return ""
+
+
+def suggest_branch(session, conf, linear=None):
+    """The branch to take a branchless session over on.
+
+    Linear's name for the ticket when the session names one -- it already
+    carries the user's prefix and the issue title. Otherwise branch_prefix plus
+    the ticket plus a slug of the task's display name, with the ticket taken
+    out of that name first so it does not appear twice.
+    """
+    head = readable_name(session)
+    ticket = head if TICKET_RE.fullmatch(head) else ""
+    if ticket:
+        found = (linear or linear_branch)(ticket)
+        if found:
+            return found
+    title = (session.get("display_name") or "").replace(ticket, "")
+    parts = [part for part in (ticket.lower(), slug(title)) if part]
+    return conf.get("branch_prefix", "") + ("-".join(parts) or session["name"])
 
 
 ICON = "C■"  # stands in for the Coder logo: these workspaces mirror a Coder one
@@ -1797,6 +1857,22 @@ def selftest():
     assert local_agent({"takeover_agent": "codex-cli"}, "claude") == "codex"
     assert set(LAUNCH) == {"claude", "codex"}
     assert TAKEOVER_FILE in LAUNCH["claude"] and TAKEOVER_FILE in LAUNCH["codex"]
+
+    assert slug("<@U0B9X> Batch: supply the engine's client error type") == \
+        "batch-supply-the-engines-client-error-type"
+    assert slug("a" * 30 + " " + "b" * 30) == "a" * 30  # cut on a word, never mid-word
+    assert slug("") == ""
+    # Linear's name wins when there is a ticket; the fallback is prefix + ticket + task,
+    # with the ticket appearing once; no ticket means prefix + task; nothing means the name.
+    assert suggest_branch(sess(display_name="fix CON2-150 now"), {"branch_prefix": "sven/"},
+                          linear=lambda t: "sven/con2-150-from-linear") == "sven/con2-150-from-linear"
+    assert suggest_branch(sess(display_name="fix CON2-150 now"), {"branch_prefix": "sven/"},
+                          linear=lambda t: "") == "sven/con2-150-fix-now"
+    assert suggest_branch(sess(display_name="fix now"), {"branch_prefix": "sven/"},
+                          linear=lambda t: "") == "sven/fix-now"
+    assert suggest_branch(sess(), {}, linear=lambda t: "") == "example-task-4f21"
+    assert suggest_branch(sess(display_name="fix CON2-150 now"), {},
+                          linear=lambda t: "") == "con2-150-fix-now"
 
     print("selftest ok")
 
