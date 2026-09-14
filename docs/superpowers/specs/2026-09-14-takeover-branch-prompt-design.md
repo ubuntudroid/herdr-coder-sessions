@@ -16,9 +16,10 @@ Everything the takeover prints is visible in that popup, including failures.
 With a terminal, `hold()` already waits for a key on failure and `notify()`
 becomes a printed line. The detached guard in `takeover()` turns from
 `sys.exit` into a prompt; the answer is carried through the existing steps and
-acted on only after `demote_mirror()`, because the last mirror refresh would
-detach a branch created earlier. New code: a branch suggestion, a prompt, a
-create-and-push step, and one ssh call that types a line into the remote agent.
+acted on right before `demote_mirror()`, after the last mirror refresh: created
+any earlier, that refresh would detach the branch again. New code: a branch
+suggestion, a prompt, a create-and-push step, and one ssh call that types a
+line into the remote agent.
 
 **Tech stack:** Python 3.9+, standard library only. git, ssh, the `herdr` CLI,
 optionally the `linear` CLI (schpet/linear-cli 2.6.0, `linear api`).
@@ -39,7 +40,7 @@ one amendment:
 
 ### Entry
 
-`[[panes]] takeover` in `herdr-plugin.toml`: `placement = "popup"`, `width =
+`[[panes]] takeover-pane` in `herdr-plugin.toml`: `placement = "popup"`, `width =
 "90%"`, `height = "50%"`, command `python3 coder-sessions.py --takeover`. The
 existing `[[actions]] takeover` keeps its command. In `main()`, `--takeover`
 without a terminal on stdin resolves the session name first (argument, then
@@ -78,6 +79,9 @@ branch [<suggestion>]:
   notes the cancel and returns (exit 0). Nothing changed: the pane closes,
   agentty keeps running, the mirror stays a mirror. Not exit 130: the
   `__main__` handler holds any non-zero `SystemExit` for a keypress.
+- A ctrl-c that lands while the Linear lookup or a validation subprocess is
+  running is not caught by the prompt and exits 130 without the "cancelled"
+  note; nothing has changed at that point either.
 - Validation, re-prompting on failure with the reason: `git check-ref-format
   --branch <answer>` (syntax) and `git -C <checkout> rev-parse --verify -q
   refs/heads/<answer>` must find nothing (a branch that exists locally cannot
@@ -126,9 +130,10 @@ mirror_session(name, conf, focus=True) (as today: refreshes the detached mirror)
 agent_pane guard                       (as today)
 branch = new_branch or checkout_branch(checkout) or branch
 render turns, write TAKEOVER_FILE with branch=branch, exclude_locally
-demote_mirror(checkout, branch)        (as today; for a new branch the ref it deletes never existed)
 if new_branch:
     git -C checkout checkout -q -b new_branch          # HEAD unchanged, working tree kept
+demote_mirror(checkout, branch)        (as today; for a new branch the ref it deletes never existed)
+if new_branch:
     push_error = git -C checkout push -q -u origin new_branch   (stderr on failure, else "")
     if not push_error: tell_remote_agent(host, message)
 split local agent, run LAUNCH, close agentty            (as today)
@@ -137,11 +142,13 @@ if new_branch: herdr workspace rename <workspace> <new_branch>   (what mirror_se
 herdr workspace focus, note(...)                        (as today, note names the branch and the push result)
 ```
 
-The branch is created after `demote_mirror()` and never before
-`mirror_session()`: that call's detached path runs `checkout --detach` on any
-mirror sitting on a branch the remote is not on, which would silently undo the
-branch. `exclude_locally` and the handover need no change; `TAKEOVER_FILE` is
-untracked and stays so on the new branch.
+The branch is created after the last `mirror_session()` refresh and directly
+before `demote_mirror()`: `mirror_session()`'s detached path runs `checkout
+--detach` on any mirror sitting on a branch the remote is not on, which would
+silently undo the branch, while a `checkout -b` failure before the demote
+leaves the mirror intact and the takeover re-runnable. `exclude_locally` and
+the handover need no change; `TAKEOVER_FILE` is untracked and stays so on the
+new branch.
 
 ### Telling the remote agent
 
@@ -169,8 +176,8 @@ it the choice.
 | invalid or existing branch name | re-prompt with the reason |
 | ctrl-c / ctrl-d at the prompt | nothing changed; the takeover notes the cancel and returns, exit 0 |
 | any exit before `demote_mirror()` | as today: held in the pane, safe to run again |
-| `git checkout -b` fails after demotion | `sys.exit` with the git error; the worktree is already the user's (marker gone, handover written), and the reason is on screen |
-| push fails | continue; skip the agent message; the closing `note()` says "not pushed: <reason>" |
+| `git checkout -b` fails | fails before the demote; the mirror is intact and the takeover can be run again |
+| push fails | continue; skip the agent message; the closing `note()` says "NOT pushed: <reason>" |
 | agent message fails | continue; one `note()` line |
 
 ### Out of scope

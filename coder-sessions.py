@@ -1472,12 +1472,13 @@ def takeover(name):
     # takeover branches -- on a name you accept: Linear's own for the ticket
     # when there is one, and always yours to replace. Asked here, off local
     # state and before any ssh, so a cancel costs nothing; the branch itself is
-    # created after the demote below, because the refresh in between would
-    # detach it again.
+    # created right before the demote below, after the last mirror refresh --
+    # created any earlier and that refresh would detach it again.
     new_branch = None
     if checkout_branch(checkout) == "HEAD":
-        print(f"{name} ({readable_name(session)}) has no branch of its own yet: "
-              f"its mirror is detached.")
+        head = readable_name(session)
+        ticket = f" ({head})" if TICKET_RE.fullmatch(head) else ""
+        print(f"{name}{ticket} has no branch of its own yet: its mirror is detached.")
         print("Take it over on a new branch, pushed to origin, and tell the remote agent.\n")
         new_branch = ask_branch(suggest_branch(session, conf), checkout)
         if not new_branch:
@@ -1533,13 +1534,18 @@ def takeover(name):
     with open(os.path.join(checkout, TAKEOVER_FILE), "w") as handle:
         handle.write(body)
     exclude_locally(checkout, TAKEOVER_FILE)
+    if new_branch:
+        # -b at the commit the mirror sits on, so the session's uncommitted work
+        # stays in the working tree -- and directly before the demote, so a name
+        # git still rejects (sven/x while refs/heads/sven exists passes both
+        # checks in ask_branch) fails while the mirror is intact and the takeover
+        # can simply be run again. The last refresh is already behind us, so
+        # nothing can detach the branch in between.
+        run(["git", "-C", checkout, "checkout", "-q", "-b", new_branch])
     demote_mirror(checkout, branch)
 
     pushed = ""
     if new_branch:
-        # -b at the commit the mirror sits on: the session's uncommitted work
-        # stays in the working tree, which is the point of taking it over.
-        run(["git", "-C", checkout, "checkout", "-q", "-b", new_branch])
         print(f"pushing {new_branch} to origin ...")
         push = subprocess.run(["git", "-C", checkout, "push", "-q", "-u", "origin", new_branch],
                               capture_output=True, text=True)
