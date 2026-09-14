@@ -2007,7 +2007,17 @@ def main():
         return promote_pane()
 
     if args.takeover is not None:
-        return takeover(args.takeover or focused_session()[1])
+        name = args.takeover or os.environ.get("CODER_SESSION") or focused_session()[1]
+        if not sys.stdin.isatty():
+            # The action runs with no terminal, and a takeover may have a question
+            # to ask and always has progress worth watching: hand it to a popup,
+            # which has one. The name goes along in the environment because the
+            # pane's process is not the action's and has no focused workspace.
+            herdr("plugin", "pane", "open",
+                  "--plugin", os.environ.get("HERDR_PLUGIN_ID", PLUGIN_ID),
+                  "--entrypoint", "takeover-pane", "--env", f"CODER_SESSION={name}")
+            return
+        return takeover(name)
 
     if args.restamp:
         return restamp()
@@ -2069,12 +2079,16 @@ def note(text):
 
 
 def notify(title, body=""):
-    """Raise a herdr notification. The only channel a plugin action has: it runs
-    with no terminal, so its stdout and stderr go nowhere anyone sees.
+    """Raise a herdr notification. The only channel a terminal-less action has;
+    with a terminal -- the takeover's popup, or a shell -- the same words are
+    printed where they can be read.
 
     Not the herdr() helper: this reports, and a reporting call that exits on a
     failure of its own would replace the thing being reported. Never raises.
     """
+    if sys.stdin.isatty():
+        print(f"{title}: {body}" if body else title)
+        return
     try:
         subprocess.run([HERDR, "notification", "show", title,
                         *(("--body", body) if body else ())], capture_output=True)

@@ -53,8 +53,19 @@ command = ["python3", "coder-sessions.py", "--web"]
 # worktree, drop the mirror, and start a local agent there. The Coder workspace is
 # left running on purpose -- the local agent may need to ssh in for a tool output
 # the handover does not carry, and pausing a task stops its workspace.
+# The action has no terminal, so `--takeover` re-opens itself in the popup below:
+# it may have a branch name to ask for, and what it prints -- progress and
+# failures -- is worth reading. The session travels in CODER_SESSION.
 [[actions]]
 id = "takeover"
 title = "Coder sessions: take over locally"
 contexts = ["workspace", "tab", "pane"]
+command = ["python3", "coder-sessions.py", "--takeover"]
+
+[[panes]]
+id = "takeover-pane"
+title = "Coder sessions: take over locally"
+placement = "popup"
+width = "90%"
+height = "50%"
 command = ["python3", "coder-sessions.py", "--takeover"]
