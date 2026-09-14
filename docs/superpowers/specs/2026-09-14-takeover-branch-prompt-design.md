@@ -74,8 +74,10 @@ branch [<suggestion>]:
 ```
 
 - Empty answer: the suggestion. Any text: that text, whole.
-- `EOFError` / `KeyboardInterrupt`: exit 130 with nothing changed. The pane
-  closes; agentty keeps running; the mirror stays a mirror.
+- `EOFError` / `KeyboardInterrupt`: the prompt answers `None`, the takeover
+  notes the cancel and returns (exit 0). Nothing changed: the pane closes,
+  agentty keeps running, the mirror stays a mirror. Not exit 130: the
+  `__main__` handler holds any non-zero `SystemExit` for a keypress.
 - Validation, re-prompting on failure with the reason: `git check-ref-format
   --branch <answer>` (syntax) and `git -C <checkout> rev-parse --verify -q
   refs/heads/<answer>` must find nothing (a branch that exists locally cannot
@@ -165,7 +167,7 @@ it the choice.
 | --- | --- |
 | Linear CLI missing, logged out, slow, or the ticket unknown | fallback suggestion; one log line |
 | invalid or existing branch name | re-prompt with the reason |
-| ctrl-c / ctrl-d at the prompt | exit 130, nothing changed |
+| ctrl-c / ctrl-d at the prompt | nothing changed; the takeover notes the cancel and returns, exit 0 |
 | any exit before `demote_mirror()` | as today: held in the pane, safe to run again |
 | `git checkout -b` fails after demotion | `sys.exit` with the git error; the worktree is already the user's (marker gone, handover written), and the reason is on screen |
 | push fails | continue; skip the agent message; the closing `note()` says "not pushed: <reason>" |

@@ -82,15 +82,16 @@ fourth ends the remote flow and continues it locally — see
 [Take over locally](#take-over-locally).
 
 A plugin action runs with no terminal, so anything it prints goes nowhere anyone sees.
-The refresh and take-over keys say what they are doing in a herdr notification instead:
-one when the ssh work starts, because both spend seconds on the network before there is
-anything to look at, and one when a refresh finishes — a take-over ends in a pane you can
-see, so it needs none — nor does moving a session into a mirror, which the refresh key
-does in a workspace that has none yet. A failure from a keypress notifies as well, and
-every failure lands in `coder-sessions.log` under `HERDR_PLUGIN_STATE_DIR`. The idle
-hook's own refresh runs through `--mirror` and says nothing at all, failures included:
-a mirror that cannot be built yet would otherwise notify after every agent turn. One
-notification per keypress, never one per turn.
+The take-over key therefore re-opens itself in a popup: what it prints is on screen,
+a failure waits for a key before the popup closes, and a session without a branch
+gets asked which one to create — see [Take over locally](#take-over-locally). The
+refresh key stays a bare action and says what it is doing in a herdr notification
+instead: one when the ssh work starts, because it spends seconds on the network before
+there is anything to look at, and one when it finishes. A failure from a keypress
+notifies as well, and every failure lands in `coder-sessions.log` under
+`HERDR_PLUGIN_STATE_DIR`. The idle hook's own refresh runs through `--mirror` and says
+nothing at all, failures included: a mirror that cannot be built yet would otherwise
+notify after every agent turn. One notification per keypress, never one per turn.
 
 Or, without installing the plugin, point a popup straight at the script:
 
@@ -290,10 +291,27 @@ and the worktree already holds everything they produced.
 agent agentapi ran on the workspace, and a name always uses that one.
 
 A session with [no branch of its own](#when-the-session-has-no-branch-of-its-own)
-cannot be taken over: its mirror is detached, so a local agent's commits would
-land on no branch at all. The key says so and leaves the session alone — the
-branch name is yours to pick, and the mirror moves onto it by itself the turn the
-remote agent branches.
+has a detached mirror, and a local agent's commits there would land on no branch at
+all. So the popup asks first:
+
+```
+asked-in-allengineering-e780 (CON2-150) has no branch of its own yet: its mirror is detached.
+Take it over on a new branch, pushed to origin, and tell the remote agent.
+
+branch [sven/con2-150-batch-supply-the-engines-client-error-type-so-a-gated-ai]:
+  enter = use this   type a name = use yours   ctrl-c = cancel
+```
+
+The suggestion is Linear's own branch name for the ticket the session names, read
+through the [`linear` CLI](https://github.com/schpet/linear-cli) when it is installed
+and logged in. Without one — or without a ticket — it is `branch_prefix` plus the
+ticket plus a slug of the task's title. Enter takes it, anything typed replaces it
+whole, ctrl-c cancels with nothing changed. The branch is created at the mirror's
+commit once the mirror is demoted, so the session's uncommitted work comes along,
+then pushed with its upstream set, and the remote agent is told in one line typed
+into its composer — queued if it is mid-turn — so any further work over there starts
+from the same branch. A push that fails is reported and not fatal: the branch exists
+locally, and the agent is not told about a branch origin does not have.
 
 The Coder workspace is **not** paused. A paused task is a stopped workspace, so
 pausing would remove the `ssh <session>.coder` the local agent is told to fall back
@@ -338,6 +356,9 @@ Needed:
 Optional, each with a working fallback:
 
 - **`fzf`** for the picker. Without it, `--list` and `--open <name>` still work.
+- **[`linear` CLI](https://github.com/schpet/linear-cli), logged in**, for the branch
+  name a take-over suggests. Without it the suggestion is built from `branch_prefix`,
+  the ticket and the task title.
 - **A local clone of the session's repo**, at `clone_root/<owner>/<repo>`. This
   is what mirroring needs; without a match the session opens as a plain
   workspace. `clone_root` defaults to `~/projects/github` — the setting most
@@ -417,6 +438,7 @@ Optional, in `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
 | `mirror` | `true` | mirror the session into a local worktree on open |
 | `mirror_root` | `"~/.herdr/worktrees"` | where a mirror lives [while the session has no branch of its own](#when-the-session-has-no-branch-of-its-own), as `<root>/<repo>/coder-<session>`. herdr's own default, so both kinds of mirror land together; point it elsewhere if you moved `worktrees.directory` |
 | `takeover_agent` | `"match"` | which agent [takes a session over locally](#take-over-locally): `"match"` uses whichever agent ran on the workspace, `"claude"` or `"codex"` always uses that one |
+| `branch_prefix` | `""` | prefix for the branch a take-over suggests when Linear cannot name the ticket, e.g. `"sven/"`. Linear's own names already carry one |
 | `token_prefix` | `"coder_"` | namespace for the [sidebar tokens](#sidebar-tokens): this prefix plus `icon` / `ticket` / `name`. Change it if another plugin already claims those names, and mirror it in `rows` |
 
 ## Notes
