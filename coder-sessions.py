@@ -1394,6 +1394,54 @@ def demote_mirror(checkout, branch):
          f"{MIRROR_REFS}/{branch}"], check=False)
 
 
+def ask_branch(suggestion, checkout):
+    """Which branch a branchless takeover should create, or None to cancel.
+
+    Enter keeps the suggestion and anything typed replaces it whole -- the
+    semantics of a placeholder, without a line editor. Validated here, before
+    the takeover reaches anything it cannot undo: a bad name would otherwise
+    surface from `checkout -b` with the marker already gone.
+    """
+    print(f"branch [{suggestion}]:")
+    print("  enter = use this   type a name = use yours   ctrl-c = cancel")
+    while True:
+        try:
+            answer = input("> ").strip() or suggestion
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if subprocess.run(["git", "check-ref-format", "--branch", answer],
+                          capture_output=True).returncode != 0:
+            print(f"  {answer!r} is not a valid branch name")
+            continue
+        if run(["git", "-C", checkout, "rev-parse", "--verify", "-q",
+                f"refs/heads/{answer}"], check=False).strip():
+            print(f"  {answer} already exists locally -- pick another name")
+            continue
+        return answer
+
+
+# Typed into the remote agent as keystrokes plus Enter, through agentapi on the
+# workspace: the request agentty makes for every key, so it lands whether the
+# agent is idle or mid-turn -- mid-turn it queues as the next input. A "user"
+# message would be refused while the agent is busy. Prints ok so the caller can
+# tell a delivered line from an ssh that ran and failed.
+AGENT_SAY = """
+import json, sys, urllib.request
+body = json.dumps({"type": "raw", "content": sys.argv[1] + "\\r"}).encode()
+req = urllib.request.Request("http://localhost:3284/message", body,
+                             {"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+print("ok")
+"""
+
+
+def tell_remote_agent(host, text):
+    """Type one line into the remote agent's composer. True when it landed."""
+    return ssh_out(host, f"python3 -c {shlex.quote(AGENT_SAY)} {shlex.quote(text)}",
+                   check=False) == "ok"
+
+
 def takeover(name):
     """Move a session from mirrored-remote to worked-on-locally, once and for good.
 
@@ -1417,20 +1465,29 @@ def takeover(name):
     if not existing or not mirror_workspace(existing):
         sys.exit(f"{name} has no mirror to take over -- prefix+ctrl+m moves it "
                  f"into one first")
+    checkout = (workspace_info(existing).get("worktree") or {}).get("checkout_path", "")
+    session = session_named(name)
     # A mirror of a session with no branch of its own is detached, and a local
-    # agent committing there would put its work on no branch at all. Refused
-    # rather than branched for you: the name is yours to pick, and the turn the
-    # agent branches the mirror moves onto that branch on its own.
-    if checkout_branch((workspace_info(existing).get("worktree") or {})
-                       .get("checkout_path", "")) == "HEAD":
-        sys.exit(f"{name} has no branch of its own yet, so its mirror is detached "
-                 f"-- take it over once the agent has branched")
+    # agent committing there would put its work on no branch at all. So the
+    # takeover branches -- on a name you accept: Linear's own for the ticket
+    # when there is one, and always yours to replace. Asked here, off local
+    # state and before any ssh, so a cancel costs nothing; the branch itself is
+    # created after the demote below, because the refresh in between would
+    # detach it again.
+    new_branch = None
+    if checkout_branch(checkout) == "HEAD":
+        print(f"{name} ({readable_name(session)}) has no branch of its own yet: "
+              f"its mirror is detached.")
+        print("Take it over on a new branch, pushed to origin, and tell the remote agent.\n")
+        new_branch = ask_branch(suggest_branch(session, conf), checkout)
+        if not new_branch:
+            note(f"takeover of {name} cancelled at the branch prompt; nothing changed")
+            return None
     # Said before the first remote call, not after: everything below is ssh and a
     # fetch, which is seconds of a keybinding looking like it did nothing. The
     # local guards above are instant, and a refusal from one of them is better as
     # its own notification alone than under a "starting" that was never true.
     notify(f"Taking over {name}", "reading the session over ssh")
-    session = session_named(name)
 
     kind = remote_agent(host)
     if kind not in LAUNCH:
@@ -1458,7 +1515,7 @@ def takeover(name):
     if not agent_pane:
         sys.exit(f"no agentty pane in {workspace} -- nothing to take over")
 
-    branch = checkout_branch(checkout) or branch
+    branch = new_branch or checkout_branch(checkout) or branch
 
     render = render_codex if kind == "codex" else render_claude
     turns = render(history_text(host, path))
@@ -1478,6 +1535,27 @@ def takeover(name):
     exclude_locally(checkout, TAKEOVER_FILE)
     demote_mirror(checkout, branch)
 
+    pushed = ""
+    if new_branch:
+        # -b at the commit the mirror sits on: the session's uncommitted work
+        # stays in the working tree, which is the point of taking it over.
+        run(["git", "-C", checkout, "checkout", "-q", "-b", new_branch])
+        print(f"pushing {new_branch} to origin ...")
+        push = subprocess.run(["git", "-C", checkout, "push", "-q", "-u", "origin", new_branch],
+                              capture_output=True, text=True)
+        if push.returncode != 0:
+            # Not a stop: the local flow does not need the push, and the branch
+            # is there to push by hand. The agent is not told about a branch
+            # origin does not have.
+            pushed = f"NOT pushed: {(push.stderr or push.stdout).strip()[:200]}"
+        else:
+            told = tell_remote_agent(
+                host, f"Taken over locally: work continues on branch {new_branch}, pushed "
+                      f"to origin. If you keep working here, run `git fetch origin && "
+                      f"git checkout {new_branch}` first.")
+            pushed = "pushed to origin, " + \
+                ("the remote agent told" if told else "but the remote agent could not be told")
+
     # Split first, close agentty last. Closing first would leave the agent's slot
     # to whatever herdr collapses into it -- on a mirrored session that is reviewr,
     # and `herdr pane run` sends text plus Enter, so the launch line would be typed
@@ -1494,9 +1572,14 @@ def takeover(name):
 
     report_tokens(workspace, session_tokens(session, branch, conf,
                                             icon=ICON_TAKEN), conf)
+    if new_branch:
+        # What mirror_session does when a mirror moves onto a branch: the label
+        # herdr gave the detached checkout was the session name, not a branch.
+        herdr("workspace", "rename", workspace, new_branch)
     herdr("workspace", "focus", workspace)
     note(f"{name} taken over locally: {len(turns)} turns in {checkout}/{TAKEOVER_FILE}, "
-         f"{chosen} running in {local}; the mirror is gone and {host} is left running")
+         f"{chosen} running in {local}; the mirror is gone and {host} is left running"
+         + (f"; {new_branch} {pushed}" if new_branch else ""))
     return workspace
 
 
