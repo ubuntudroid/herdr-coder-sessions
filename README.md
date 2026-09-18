@@ -160,10 +160,14 @@ plugin publishes is prefixed `coder_`. Change the prefix in the plugin's own
 `config.json` (`token_prefix`) if something else already claims those names, and
 mirror it in `rows`; set it to `""` for bare `icon` / `ticket` / `name`.
 
-Tokens are display-only: a herdr restart drops them. The plugin re-stamps a
-workspace whenever the picker runs, recognising it by the session name herdr's
-agent detection reads off the agentty pane. `--restamp` is the same thing on
-demand, and is idempotent.
+Tokens are display-only: a herdr restart drops them, and it kills agentty too, so a
+session's workspace comes back as empty shells. The plugin's startup hook runs
+`--restamp` once herdr has restored the session: a workspace still running agentty is
+recognised by the session name herdr's agent detection reads off that pane; a mirror
+workspace that lost it is recognised by the session name the mirror records in its
+marker, gets agentty restarted in its first pane, and is stamped again. Paused sessions
+are re-attached too — agentty's ssh starts their workspace. The picker re-stamps as
+well whenever it runs, and `--restamp` is the same thing on demand, idempotent.
 
 ## What's in here
 
@@ -223,8 +227,8 @@ still there for whatever tool you prefer.
   workspace's mirror — or, in a workspace that has none yet, moves the session into one. It
   reads the session name from the [`$coder_name` token](#sidebar-tokens), so it needs no argument,
   and refuses cleanly in a workspace that is not a session's. It resets the mirror hard, so it
-  will not guess: after a herdr restart has dropped the tokens, open the picker once (or run
-  `--restamp`) to put them back.
+  will not guess: the tokens have to be there, which after a herdr restart the
+  [startup hook](#sidebar-tokens) takes care of.
 - **On first open**, as part of building the workspace.
 
 Re-picking an already-open session only focuses it; it does not refresh.

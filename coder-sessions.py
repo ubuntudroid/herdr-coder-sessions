@@ -18,7 +18,9 @@ that is already open focuses its workspace instead of building a second one.
     coder-sessions.py --promote        the pane that asks before moving a session
     coder-sessions.py --takeover [NAME] hand this session's conversation to a local
                                         agent and stop mirroring it
-    coder-sessions.py --restamp        re-publish the sidebar tokens on open workspaces
+    coder-sessions.py --restamp        re-publish the sidebar tokens on open workspaces,
+                                       and restart agentty where a herdr restart dropped
+                                       it (what the manifest's startup hook runs)
     coder-sessions.py --selftest       check the naming helpers
 
 `coder task list` costs ~700ms, too slow to run per keystroke, so --list writes
@@ -433,6 +435,36 @@ def is_mirror(checkout):
     return os.path.exists(mirror_marker(checkout))
 
 
+def stamp_mirror(checkout, name):
+    """Mark `checkout` as a mirror of session `name`.
+
+    The name goes into the marker so a herdr restart -- which drops the tokens and
+    kills agentty, the two things that otherwise say whose workspace this is --
+    still leaves something on disk that names the session. Rewritten on every
+    refresh, so a mirror from before the name was recorded picks it up.
+    """
+    with open(mirror_marker(checkout), "w") as handle:
+        handle.write(name + "\n")
+
+
+def basename_session(base):
+    """The session a pre-branch mirror path names: `coder-<session>` -> session."""
+    prefix = "coder-"
+    return base[len(prefix):] if base.startswith(prefix) and len(base) > len(prefix) else ""
+
+
+def mirror_name(checkout):
+    """The session a mirror belongs to, read off disk: the marker, else a
+    pre-branch path. "" when neither says -- a mirror built on a branch by an
+    older version, until its next refresh rewrites the marker."""
+    try:
+        with open(mirror_marker(checkout)) as handle:
+            name = handle.read().strip()
+    except OSError:
+        name = ""
+    return name or basename_session(os.path.basename(checkout.rstrip("/")))
+
+
 def repo_slug(origin_url):
     """`owner/repo` from any of git@host:o/r.git, https://host/o/r.git, ssh://host/o/r."""
     url = origin_url.strip().removesuffix(".git")
@@ -750,6 +782,9 @@ def mirror_session(name, conf, focus=False):
             note(f"{checkout} is not a mirror (no {MIRROR_MARK} marker) -- {name} "
                  f"gets none while that worktree is there")
             return None, None
+        # Every refresh, not only creation: a mirror from before the marker held a
+        # name gets one the first time the idle hook comes round.
+        stamp_mirror(checkout, name)
         workspace = workspace_for_path(checkout)
         if workspace is None:
             workspace = herdr("worktree", "open", "--cwd", clone, "--path", checkout,
@@ -792,7 +827,7 @@ def mirror_session(name, conf, focus=False):
         workspace = herdr("worktree", "open", "--cwd", clone, "--path", pre,
                           *(("--focus",) if focus else ("--no-focus",))
                           )["result"]["workspace"]["workspace_id"]
-        open(mirror_marker(checkout), "w").close()
+        stamp_mirror(checkout, name)
     else:
         claimable(clone, branch, base)
         run(["git", "-C", clone, "branch", "-f", branch, base])
@@ -801,7 +836,7 @@ def mirror_session(name, conf, focus=False):
                         *(("--focus",) if focus else ("--no-focus",)))["result"]
         workspace = created["workspace"]["workspace_id"]
         checkout = created["workspace"]["worktree"]["checkout_path"]
-        open(mirror_marker(checkout), "w").close()
+        stamp_mirror(checkout, name)
 
     # herdr creates a branch at the clone's HEAD unless told otherwise, so never
     # trust the name alone -- check the commit.
@@ -1230,11 +1265,13 @@ def open_session(name, sessions=None):
     attach_session(name, session, conf, workspace, checkout)
 
 
-def attach_session(name, session, conf, workspace, checkout):
+def attach_session(name, session, conf, workspace, checkout, focus=True):
     """Give the session a workspace: tokens, agentty, focus.
 
     Shared by the first open and by promote(), which is this same setup run again
-    once a mirror the first open could not build has become possible.
+    once a mirror the first open could not build has become possible -- and by
+    restamp() after a herdr restart, which re-attaches every mirror at once and
+    must not drag the focus through them.
     """
     if workspace:
         # The worktree workspace is the session's workspace: herdr gives it the
@@ -1271,7 +1308,8 @@ def attach_session(name, session, conf, workspace, checkout):
     # too, so a reused checkout gets a pane like a fresh mirror does. The
     # open_reviewr() workaround for reviewr#82 was removed 2026-09-01 when that
     # landed -- racing reviewr's own handler was what left two panes.
-    herdr("workspace", "focus", workspace)
+    if focus:
+        herdr("workspace", "focus", workspace)
     return workspace
 
 
@@ -1784,6 +1822,12 @@ def restamp():
     Workspaces are found by the session name on their agentty pane, checked
     against the sessions that exist, so this also reaches one whose token was
     never stamped -- opened before the token existed, or by an older version.
+
+    A restart also kills agentty, and with it the name on the pane. A mirror
+    workspace still says whose it is in its marker, so one that has lost agentty
+    gets it back -- the same attach the first open does, focus aside. Paused
+    sessions included: agentty's ssh starts their workspace, which is what the
+    user asked a restart to cost. The startup hook in the manifest runs this.
     """
     conf = settings()
     known = {s["name"]: s for s in (describe(t) for t in running_sessions(False))}
@@ -1794,11 +1838,27 @@ def restamp():
     for w in herdr("workspace", "list").get("result", {}).get("workspaces", []):
         workspace = w["workspace_id"]
         tokens = w.get("tokens") or {}
-        name = tokens.get(token) or by_pane.get(workspace, "")
+        checkout = (w.get("worktree") or {}).get("checkout_path", "")
+        # `.git` first: mirror_marker() asks git, and run() would end the whole
+        # pass on a checkout that is no repository any more.
+        mirror = bool(checkout) and os.path.exists(os.path.join(checkout, ".git")) \
+            and is_mirror(checkout)
+        # The first candidate that names a session that exists: the pane's says
+        # "claude" for any local agent pane, so it must not shadow the marker.
+        candidates = (tokens.get(token), by_pane.get(workspace),
+                      mirror_name(checkout) if mirror else "")
+        name = next((n for n in candidates if n in known), "")
         session = known.get(name)
         if not session:
             continue
-        branch = checkout_branch((w.get("worktree") or {}).get("checkout_path"))
+        # Same reason the pane's name is compared, not its presence: "claude"
+        # there means a local agent pane, not the agentty this mirror lost.
+        if mirror and by_pane.get(workspace) != name:
+            attach_session(name, session, conf, workspace, checkout, focus=False)
+            print(f"{workspace}: agentty restarted for {name}")
+            changes += 1
+            continue
+        branch = checkout_branch(checkout)
         # session_tokens() defaults to ICON, the mirror icon -- right for every
         # workspace except one takeover() already stamped ICON_TAKEN on. That
         # icon is the only sidebar signal telling a taken-over worktree apart
@@ -1963,6 +2023,14 @@ def selftest():
     assert suggest_branch(sess(display_name="fix CON2-150 now"), {},
                           linear=lambda t: "") == "con2-150-fix-now"
 
+    # A mirror names its session in its marker; older markers are empty, and then
+    # only a pre-branch path (mirror_root/<repo>/coder-<session>) still says.
+    assert basename_session("coder-asked-in-db1a") == "asked-in-db1a"
+    assert basename_session("coder-implement-ticket-con2-40-b6e8") == "implement-ticket-con2-40-b6e8"
+    assert basename_session("pgrowth-664") == ""
+    assert basename_session("coder-") == ""
+    assert basename_session("") == ""
+
     print("selftest ok")
 
 
@@ -1989,7 +2057,9 @@ def main():
                         help="hand a session's conversation to a local agent and "
                              "drop its mirror; without NAME, the focused workspace's")
     parser.add_argument("--restamp", action="store_true",
-                        help="re-publish the sidebar tokens on open Coder workspaces")
+                        help="re-publish the sidebar tokens on open Coder workspaces, and "
+                             "restart agentty where a herdr restart dropped it (the "
+                             "startup hook)")
     parser.add_argument("--pane", action="store_true",
                         help="open the picker as a plugin pane (what the action does)")
     parser.add_argument("--list", action="store_true", help="print rows, no picker")

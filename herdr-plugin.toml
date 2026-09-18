@@ -62,6 +62,13 @@ title = "Coder sessions: take over locally"
 contexts = ["workspace", "tab", "pane"]
 command = ["python3", "coder-sessions.py", "--takeover"]
 
+# A herdr restart keeps the workspaces but drops the sidebar tokens and the
+# processes in the panes -- agentty included -- so a session's workspace comes
+# back as empty shells nobody can tell apart. Once herdr has restored the
+# session, put the tokens back and restart agentty where a mirror lost it.
+[[startup]]
+command = ["python3", "coder-sessions.py", "--restamp"]
+
 [[panes]]
 id = "takeover-pane"
 title = "Coder sessions: take over locally"
