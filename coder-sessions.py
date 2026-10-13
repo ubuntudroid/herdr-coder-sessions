@@ -175,6 +175,11 @@ def agentty_cmd():
     sys.exit("agentty not found: expected it beside this script or on PATH")
 
 
+def agentty_launch(host):
+    """The shell command that starts agentty for one SSH host."""
+    return f"{agentty_cmd()} {shlex.quote(host)}"
+
+
 def running_sessions(running_only=True):
     """Coder tasks. By default only those whose workspace is up, so agentapi is
     reachable; pass False when stamping workspace tokens, where a stopped
@@ -1302,7 +1307,7 @@ def attach_session(name, session, conf, workspace, checkout, focus=True):
     if pane_running(top, "agentty"):
         note(f"focused {workspace} for {name}: agentty already in {top}")
     else:
-        herdr("pane", "run", top, f"{hook}{agentty_cmd()} {host}")
+        herdr("pane", "run", top, f"{hook}{agentty_launch(host)}")
         note(f"opened {workspace} for {name}: agentty in {top}")
     # reviewr opens itself on worktree.created and, since 0.36.2, on worktree.opened
     # too, so a reused checkout gets a pane like a fresh mirror does. The
@@ -1882,6 +1887,13 @@ def selftest():
         base = {"name": "example-task-4f21", "display_name": "", "message": "", "prompt": ""}
         base.update(kw)
         return base
+
+    hostile_host = "session; :"
+    parsed = subprocess.run(
+        ["/bin/sh", "-c",
+         f'set -- {agentty_launch(hostile_host)}; printf "%s\\n" "$#" "$2"'],
+        text=True, capture_output=True, check=True).stdout.splitlines()
+    assert parsed == ["2", hostile_host]
 
     assert readable_name(sess(display_name="tackle PROJ-42")) == "PROJ-42"
     assert readable_name(sess(display_name="<@U0B9X> get cracking on TEAM2-7")) == "TEAM2-7"
